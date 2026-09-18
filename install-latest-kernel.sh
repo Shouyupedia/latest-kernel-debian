@@ -203,6 +203,9 @@ fi
 update_grub_command="$(resolve_admin_command update-grub || true)"
 [[ -n "$update_grub_command" ]] \
     || die "未检测到 GRUB/update-grub，无法安全确认新内核启动项。"
+shutdown_command="$(resolve_admin_command shutdown || true)"
+[[ -n "$shutdown_command" ]] \
+    || die "未检测到 shutdown，无法安排安装后的自动重启。"
 
 available_boot_kb="$(df -Pk /boot | awk 'NR == 2 { print $4 }')"
 if [[ "$available_boot_kb" =~ ^[0-9]+$ ]]; then
@@ -701,10 +704,33 @@ run_root install -d -m 0755 "$STATE_DIR"
 run_root install -m 0644 "$state_tmp" "${STATE_FILE}.new"
 run_root mv -f "${STATE_FILE}.new" "$STATE_FILE"
 
+stage="安排自动重启"
+# 按安装完成时的本地日期取次日，不能直接用 shutdown HH:MM，
+# 否则凌晨安装时可能在当天重启。先确定窗口，再随机选择整分钟延迟。
+installed_at="$(date +%s)"
+installed_date="$(date -d "@$installed_at" +%F)"
+reboot_date="$(date -d "$installed_date 12:00:00 tomorrow" +%F)"
+reboot_window_start="$(date -d "$reboot_date 03:20:00" +%s)"
+reboot_window_end="$(date -d "$reboot_date 03:40:00" +%s)"
+# shutdown +N 从执行时刻起等待 N 分钟；向内取整，避免秒数使重启越过窗口。
+minimum_delay=$(((reboot_window_start - installed_at + 59) / 60))
+maximum_delay=$(((reboot_window_end - installed_at) / 60))
+((minimum_delay > 0 && maximum_delay >= minimum_delay)) \
+    || die "内核已安装，但无法计算次日的重启时间，请手动重启。"
+reboot_delay=$((minimum_delay + RANDOM % (maximum_delay - minimum_delay + 1)))
+reboot_at=$((installed_at + reboot_delay * 60))
+reboot_time="$(date -d "@$reboot_at" '+%Y-%m-%d %H:%M:%S %Z (%z)')"
+if ! run_root "$shutdown_command" -r "+$reboot_delay" \
+    "内核 $kernel_release 已安装，计划于 $reboot_time 自动重启。"; then
+    die "内核已安装，但自动重启安排失败，请手动重启。"
+fi
+
 stage="完成"
 log "内核 $kernel_release 已安装并加入 GRUB，重启后生效。"
+log "计划重启时间：$reboot_time（服务器本地时间）。"
 if [[ "$kept_running_kernel" == true ]]; then
     log "当前运行的旧内核已安全保留；重启进入新内核后可再次运行脚本清理。"
 fi
-printf "    运行 '%sreboot' 重启系统。\n" \
-    "$([[ ${#as_root[@]} -eq 0 ]] && printf '' || printf 'sudo ')"
+printf "    如需取消自动重启，运行 '%s%s -c'。\n" \
+    "$([[ ${#as_root[@]} -eq 0 ]] && printf '' || printf 'sudo ')" \
+    "$shutdown_command"

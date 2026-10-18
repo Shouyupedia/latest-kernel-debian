@@ -19,6 +19,14 @@ env:
   DEBIAN_CONFIG_REPO: https://salsa.debian.org/kernel-team/linux.git
   DEBIAN_CONFIG_REF: debian/latest
   DEBIAN_FRONTEND: noninteractive
+  # Primary key fingerprints that sign Linux mainline and stable tags:
+  # Linus Torvalds, Greg Kroah-Hartman and Sasha Levin (kernel.org).
+  KERNEL_TAG_SIGNERS: >-
+    ABAF11C65A2970B130ABE3C479BE3E4300411886
+    647F28654894E3BD457199BE38DBBDC86092693E
+    E27E5D8A3403A2EF66873BBCDEA66FF797772CDC
+  # GitHub Release tag that hosts the signed APT index (a flat repository).
+  APT_SUITE: apt
 
 jobs:
   check:
@@ -179,9 +187,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # One listing serves every tag lookup in this job; it already
+          # contains the peeled ^{} commit of each annotated tag.
+          kernel_tags="$RUNNER_TEMP/kernel-tags.txt"
+          git ls-remote --tags "$KERNEL_REPO" > "$kernel_tags"
           latest_tag="$(
-            git ls-remote --tags "$KERNEL_REPO" \
-              | awk '{print $2}' \
+            awk '{print $2}' "$kernel_tags" \
               | sed 's#refs/tags/##' \
               | grep -Ev '\^\{\}|-rc' \
               | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?$' \
@@ -195,14 +206,11 @@ jobs:
           fi
 
           source_commit="$(
-            git ls-remote "$KERNEL_REPO" \
-              "refs/tags/${latest_tag}" \
-              "refs/tags/${latest_tag}^{}" \
-              | awk '
-                  /\^\{\}$/ { print $1; found=1; exit }
-                  { fallback=$1 }
-                  END { if (!found && fallback) print fallback }
-                '
+            awk -v ref="refs/tags/${latest_tag}" '
+              $2 == ref "^{}" { print $1; found=1; exit }
+              $2 == ref { fallback=$1 }
+              END { if (!found && fallback) print fallback }
+            ' "$kernel_tags"
           )"
           if ! [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::Could not resolve source commit for $latest_tag"
@@ -340,9 +348,10 @@ jobs:
         if: steps.version.outputs.should_build == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          kernel_series="$(cut -d. -f1,2 <<< "${{ steps.version.outputs.version }}")"
+          kernel_series="$(cut -d. -f1,2 <<< "$VERSION")"
           series_tag="v${kernel_series}"
           branch="${kernel_series}/bbr3"
           tip="$(
@@ -394,14 +403,11 @@ jobs:
           # GitHub's API. This pins the short, unique topic chain without
           # downloading thousands of unrelated commits from both repositories.
           series_commit="$(
-            git ls-remote "$KERNEL_REPO" \
-              "refs/tags/${series_tag}" \
-              "refs/tags/${series_tag}^{}" \
-              | awk '
-                  /\^\{\}$/ { print $1; found=1; exit }
-                  { fallback=$1 }
-                  END { if (!found && fallback) print fallback }
-                '
+            awk -v ref="refs/tags/${series_tag}" '
+              $2 == ref "^{}" { print $1; found=1; exit }
+              $2 == ref { fallback=$1 }
+              END { if (!found && fallback) print fallback }
+            ' "$RUNNER_TEMP/kernel-tags.txt"
           )"
           if ! [[ "$series_commit" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::Could not resolve mainline series tag $series_tag"
@@ -635,6 +641,35 @@ jobs:
             exit 1
           fi
 
+          notes_file="$RUNNER_TEMP/release.md"
+          printf 'Version: `%s`\n\nBuild time: `%s`\n' \
+            "$KERNEL_RELEASE" \
+            "$build_time" \
+            > "$notes_file"
+          expected_body="$(cat "$notes_file")"
+
+          # This job runs on every scheduled check without a new kernel. Leave
+          # an already normalized Release untouched instead of rewriting its
+          # notes and assets every three hours.
+          already_normalized=true
+          for kind in image headers; do
+            [[ "${asset_digest[$kind]}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+              || already_normalized=false
+          done
+          ((${#extra_asset_ids[@]} == 0)) || already_normalized=false
+          [[ "$(jq -r '.name // ""' "$release_json")" == "$KERNEL_RELEASE" \
+            && "$existing_body" == "$expected_body" ]] \
+            || already_normalized=false
+          latest_tag="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name' \
+              2>/dev/null || true
+          )"
+          [[ "$latest_tag" == "$RELEASE_TAG" ]] || already_normalized=false
+          if [[ "$already_normalized" == true ]]; then
+            echo "Release $RELEASE_TAG is already normalized; nothing to change."
+            exit 0
+          fi
+
           # Older GitHub assets may predate server-side digests. Refresh only
           # those assets from their already-published bytes; no kernel rebuild
           # is performed.
@@ -688,11 +723,6 @@ jobs:
               "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id_to_delete}"
           done
 
-          notes_file="$RUNNER_TEMP/release.md"
-          printf 'Version: `%s`\n\nBuild time: `%s`\n' \
-            "$KERNEL_RELEASE" \
-            "$build_time" \
-            > "$notes_file"
           gh release edit \
             "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
@@ -702,7 +732,6 @@ jobs:
             --prerelease=false \
             --latest
 
-          expected_body="$(cat "$notes_file")"
           final_release_json="$RUNNER_TEMP/final-release.json"
           final_assets_file="$RUNNER_TEMP/final-assets.tsv"
           verified=false
@@ -797,6 +826,12 @@ jobs:
       # A defined LOCALVERSION suppresses the SCM "+" added after the BBRv3
       # commits, while remaining inherited by bindeb-pkg's recursive make.
       LOCALVERSION: "-shouyu"
+      # Stable identity for /proc/version and the package Maintainer field
+      # instead of the ephemeral runner hostname.
+      KBUILD_BUILD_USER: shouyu
+      KBUILD_BUILD_HOST: github-actions
+      DEBFULLNAME: Kernel Builder
+      DEBEMAIL: kernel-builder@users.noreply.github.com
 
     steps:
       - name: Notify Telegram that the build started
@@ -862,21 +897,63 @@ jobs:
 
       - name: Free disk space
         run: |
-          set -euxo pipefail
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
-            /usr/local/share/boost || true
-          if [[ "${AGENT_TOOLSDIRECTORY:-}" == "/opt/hostedtoolcache" ]]; then
-            sudo rm -rf /opt/hostedtoolcache
+          set -euo pipefail
+          # Without debug info the source tree, objects, packages and compiler
+          # cache stay well under 10 GiB. Deleting the preinstalled SDKs takes
+          # minutes, so only do it when the runner is actually short on space.
+          available_kb="$(df -Pk /tmp | awk 'NR == 2 { print $4 }')"
+          if [[ "$available_kb" =~ ^[0-9]+$ ]] \
+            && ((available_kb >= 20 * 1024 * 1024)); then
+            echo "$((available_kb / 1024 / 1024)) GiB free; skipping cleanup."
+          else
+            set -x
+            sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+              /usr/local/share/boost || true
+            if [[ "${AGENT_TOOLSDIRECTORY:-}" == "/opt/hostedtoolcache" ]]; then
+              sudo rm -rf /opt/hostedtoolcache
+            fi
           fi
-          df -h
+          df -h /tmp
 
       - name: Install build dependencies
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          # Skip man-db's index rebuild, which otherwise runs on every install.
+          sudo rm -f /var/lib/man-db/auto-update
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
             build-essential bc kmod cpio flex libssl-dev libelf-dev libdw-dev bison \
-            debhelper dpkg-dev rsync fakeroot xz-utils zstd
+            debhelper dpkg-dev rsync xz-utils zstd ccache
+
+      - name: Prepare compiler cache
+        id: ccache
+        env:
+          KERNEL_VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          series="$(cut -d. -f1,2 <<< "$KERNEL_VERSION")"
+          [[ "$series" =~ ^[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::Invalid kernel version"; exit 1; }
+          # The ccache masquerade directory turns every gcc/cc call, including
+          # the ones made by bindeb-pkg's nested make, into a cached call.
+          echo "/usr/lib/ccache" >> "$GITHUB_PATH"
+          {
+            echo "CCACHE_DIR=$RUNNER_TEMP/ccache"
+            echo "CCACHE_MAXSIZE=2G"
+          } >> "$GITHUB_ENV"
+          {
+            echo "key=ccache-v1-${KERNEL_VERSION}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "series_prefix=ccache-v1-${series}."
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ${{ steps.ccache.outputs.key }}
+          restore-keys: |
+            ${{ steps.ccache.outputs.series_prefix }}
+            ccache-v1-
 
       - name: Download current kernel config snapshot
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -884,23 +961,92 @@ jobs:
           name: kernel-configs-${{ github.run_id }}
           path: ${{ github.workspace }}
 
-      - name: Clone stable kernel
+      - name: Clone stable kernel and verify its signed tag
+        env:
+          SOURCE_TAG: ${{ needs.check.outputs.source_tag }}
+          SOURCE_COMMIT: ${{ needs.check.outputs.source_commit }}
         run: |
           set -euo pipefail
+          if ! [[ "$SOURCE_TAG" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ \
+            && "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid kernel source metadata"
+            exit 1
+          fi
           git clone \
             --depth=1 \
             --single-branch \
-            --branch "${{ needs.check.outputs.source_tag }}" \
+            --branch "$SOURCE_TAG" \
             "$KERNEL_REPO" \
             /tmp/linux
           actual_commit="$(git -C /tmp/linux rev-parse HEAD)"
-          if [[ "$actual_commit" != "${{ needs.check.outputs.source_commit }}" ]]; then
-            echo "::error::Source tag moved: expected ${{ needs.check.outputs.source_commit }}, got $actual_commit"
+          if [[ "$actual_commit" != "$SOURCE_COMMIT" ]]; then
+            echo "::error::Source tag moved: expected $SOURCE_COMMIT, got $actual_commit"
             exit 1
           fi
 
+          # The git server is trusted for transport only. The annotated tag
+          # must carry a good signature from one of the pinned kernel.org
+          # release keys, and must itself name this version and commit so an
+          # older signed tag cannot be replayed under a newer ref name. Key
+          # material may come from any source: only the fingerprint is trusted.
+          export GNUPGHOME="$RUNNER_TEMP/kernel-gnupg"
+          install -d -m 0700 "$GNUPGHOME"
+          for fpr in $KERNEL_TAG_SIGNERS; do
+            key_id="${fpr: -16}"
+            for key_url in \
+              "https://git.kernel.org/pub/scm/docs/kernel/pgpkeys.git/plain/keys/${key_id}.asc" \
+              "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x${fpr}"; do
+              if curl --fail --silent --show-error --location \
+                --proto '=https' --retry 2 --connect-timeout 10 --max-time 60 \
+                "$key_url" \
+                | gpg --batch --quiet --import-options import-minimal --import \
+                  >/dev/null 2>&1 \
+                && gpg --batch --list-keys "$fpr" >/dev/null 2>&1; then
+                break
+              fi
+            done
+            gpg --batch --list-keys "$fpr" >/dev/null 2>&1 \
+              || echo "::warning::Could not fetch kernel signing key $fpr"
+          done
+
+          if ! tag_header="$(
+            git -C /tmp/linux cat-file tag "$SOURCE_TAG" | sed -n '1,/^$/p'
+          )"; then
+            echo "::error::$SOURCE_TAG is not an annotated tag"
+            exit 1
+          fi
+          if [[ "$(sed -n 's/^tag //p' <<< "$tag_header")" != "$SOURCE_TAG" \
+            || "$(sed -n 's/^object //p' <<< "$tag_header")" != "$SOURCE_COMMIT" \
+            || "$(sed -n 's/^type //p' <<< "$tag_header")" != "commit" ]]; then
+            echo "::error::Tag object does not describe $SOURCE_TAG at $SOURCE_COMMIT"
+            exit 1
+          fi
+          if ! tag_status="$(git -C /tmp/linux verify-tag --raw "$SOURCE_TAG" 2>&1)"; then
+            printf '%s\n' "$tag_status"
+            echo "::error::$SOURCE_TAG does not carry a valid kernel.org signature"
+            exit 1
+          fi
+          tag_signer="$(
+            awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" { print $NF; exit }' \
+              <<< "$tag_status"
+          )"
+          if ! grep -q '^\[GNUPG:\] GOODSIG ' <<< "$tag_status" \
+            || [[ ! "$tag_signer" =~ ^[0-9A-F]{40}$ \
+              || " $KERNEL_TAG_SIGNERS " != *" $tag_signer "* ]]; then
+            printf '%s\n' "$tag_status"
+            echo "::error::$SOURCE_TAG is not signed by a pinned kernel.org release key"
+            exit 1
+          fi
+          echo "$SOURCE_TAG is signed by $tag_signer"
+          echo "- Stable tag signer: \`$tag_signer\`" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Add BBRv3 alongside BBRv1
         id: bbr3
+        env:
+          bbr3_branch: ${{ needs.check.outputs.bbr3_branch }}
+          expected_base: ${{ needs.check.outputs.bbr3_base }}
+          expected_commit_count: ${{ needs.check.outputs.bbr3_commit_count }}
+          expected_tip: ${{ needs.check.outputs.bbr3_tip }}
         run: |
           set -euo pipefail
           cd /tmp/linux
@@ -909,11 +1055,10 @@ jobs:
           # the applied series is diffed against below.
           pristine_commit="$(git rev-parse HEAD)"
 
-          bbr3_branch="${{ needs.check.outputs.bbr3_branch }}"
-          expected_base="${{ needs.check.outputs.bbr3_base }}"
-          expected_commit_count="${{ needs.check.outputs.bbr3_commit_count }}"
-          expected_tip="${{ needs.check.outputs.bbr3_tip }}"
-
+          if ! [[ "$bbr3_branch" =~ ^[0-9]+\.[0-9]+/bbr3$ ]]; then
+            echo "::error::Invalid pinned BBRv3 branch"
+            exit 1
+          fi
           if ! [[ "$expected_base" =~ ^[0-9a-f]{40}$ &&
                   "$expected_tip" =~ ^[0-9a-f]{40}$ &&
                   "$expected_commit_count" =~ ^[0-9]+$ ]]; then
@@ -1055,6 +1200,17 @@ jobs:
             fi
           done < <(grep -E '^\+[^+]' "$makefile_diff" || true)
 
+          # Kconfig is parsed by "make olddefconfig", and Kconfig macros such
+          # as $(shell,...) run commands at parse time. The series may only add
+          # plain symbol definitions to net/ipv4/Kconfig.
+          kconfig_diff="$RUNNER_TEMP/bbr3-kconfig.diff"
+          git diff "$pristine_commit" -- net/ipv4/Kconfig > "$kconfig_diff"
+          if grep -qE '^\+([^+].*)?\$\(|^\+[[:space:]]*o?r?source[[:space:]]' \
+            "$kconfig_diff"; then
+            echo "::error::The BBRv3 series adds Kconfig macros or source directives to net/ipv4/Kconfig"
+            exit 1
+          fi
+
           grep -q '^config TCP_CONG_BBR3$' net/ipv4/Kconfig
           grep -Fq 'obj-$(CONFIG_TCP_CONG_BBR3) += tcp_bbr3.o' net/ipv4/Makefile
           grep -qE '^#define BBR_VERSION[[:space:]]+3$' net/ipv4/tcp_bbr3.c
@@ -1153,6 +1309,14 @@ jobs:
               fail=1
             fi
           }
+          check_empty_string() {
+            # Path-valued options would embed files from the build machine
+            # into the published kernel image.
+            if grep -qE "^CONFIG_$1=\"[^\"]" .config; then
+              echo "::error::CONFIG_$1 must be empty"
+              fail=1
+            fi
+          }
 
           while IFS= read -r requested_setting; do
             if [[ ! "$requested_setting" =~ ^CONFIG_[A-Z0-9_]+= \
@@ -1243,6 +1407,8 @@ jobs:
           check_not_enabled GDB_SCRIPTS
           check_not_enabled LOCKDEP
           check_not_enabled DEFAULT_BBR3
+          check_empty_string INITRAMFS_SOURCE
+          check_empty_string EXTRA_FIRMWARE
           [[ "$LOCALVERSION" == "-shouyu" ]] || {
             echo "::error::LOCALVERSION is invalid"
             fail=1
@@ -1255,26 +1421,53 @@ jobs:
           echo "All checks passed."
 
       - name: Build kernel
+        id: build-kernel
+        env:
+          EXPECTED_RELEASE: ${{ needs.check.outputs.version }}-shouyu
         run: |
           set -euxo pipefail
           cd /tmp/linux
           KREL="$(make -s kernelrelease)"
-          expected="${{ needs.check.outputs.version }}-shouyu"
-          if [[ "$KREL" != "$expected" ]]; then
-            echo "::error::Expected kernel release $expected, got $KREL"
+          if [[ "$KREL" != "$EXPECTED_RELEASE" ]]; then
+            echo "::error::Expected kernel release $EXPECTED_RELEASE, got $KREL"
             exit 1
           fi
-          fakeroot make -j"$(nproc)" bindeb-pkg \
+          ccache --zero-stats
+          # bindeb-pkg is rootless (Rules-Requires-Root: no; dpkg-deb
+          # --root-owner-group), so the compile does not run under fakeroot's
+          # LD_PRELOAD, which serializes every stat() through faked.
+          make -j"$(nproc)" bindeb-pkg \
             KBUILD_DEBARCH=amd64 \
             KDEB_PKGVERSION="${KREL}-1"
+          {
+            echo "### Compiler cache"
+            echo
+            echo '```'
+            ccache --show-stats
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save compiler cache
+        if: >-
+          ${{
+            always() &&
+            (steps.build-kernel.outcome == 'success' ||
+             steps.build-kernel.outcome == 'failure')
+          }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: ${{ steps.ccache.outputs.key }}
 
       - name: Get kernel release
         id: krel
+        env:
+          EXPECTED_RELEASE: ${{ needs.check.outputs.version }}-shouyu
         run: |
           set -euo pipefail
           cd /tmp/linux
           release="$(make -s kernelrelease)"
-          expected="${{ needs.check.outputs.version }}-shouyu"
+          expected="$EXPECTED_RELEASE"
           if [[ "$release" != "$expected" ]]; then
             echo "::error::Expected kernel release $expected, got $release"
             exit 1
@@ -1283,9 +1476,10 @@ jobs:
 
       - name: Collect and verify Debian packages
         id: packages
+        env:
+          krel: ${{ steps.krel.outputs.release }}
         run: |
           set -euxo pipefail
-          krel="${{ steps.krel.outputs.release }}"
           shopt -s nullglob
           image_packages=(/tmp/"linux-image-${krel}_"*"_amd64.deb")
           header_packages=(/tmp/"linux-headers-${krel}_"*"_amd64.deb")
@@ -1331,10 +1525,24 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Verify image package contents
+        env:
+          krel: ${{ steps.krel.outputs.release }}
+          IMAGE_PACKAGE: ${{ steps.packages.outputs.image }}
         run: |
           set -euxo pipefail
-          krel="${{ steps.krel.outputs.release }}"
-          image_deb="artifacts/${{ steps.packages.outputs.image }}"
+          image_deb="artifacts/$IMAGE_PACKAGE"
+
+          # The packages are built without fakeroot, so prove that every
+          # installed path is still owned by root rather than the runner user.
+          for deb in artifacts/*.deb; do
+            if ! dpkg-deb --fsys-tarfile "$deb" \
+              | tar -tvf - \
+              | awk '$2 != "root/root" { print; bad = 1 } END { exit bad }'; then
+              echo "::error::$deb contains files not owned by root:root"
+              exit 1
+            fi
+          done
+
           mkdir -p /tmp/img-check
           dpkg-deb -x "$image_deb" /tmp/img-check
 
@@ -1675,12 +1883,354 @@ jobs:
           [[ "$verified" == true ]] \
             || { echo "::error::Release verification failed"; exit 1; }
 
+  apt-repository:
+    name: Publish signed APT repository
+    needs:
+      - check
+      - build
+      - release
+      - repair-existing-release
+    if: >-
+      ${{
+        always() &&
+        needs.check.result == 'success' &&
+        (needs.release.result == 'success' ||
+         needs.repair-existing-release.result == 'success')
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      APT_PUBLIC_KEY: apt/shouyu-kernel-archive-keyring.asc
+      REPOSITORY: ${{ github.repository }}
+      FROM_BUILD: ${{ needs.release.result == 'success' }}
+      KERNEL_RELEASE: >-
+        ${{
+          needs.release.result == 'success'
+          && needs.build.outputs.kernel_release
+          || needs.check.outputs.existing_kernel_release
+        }}
+      RELEASE_TAG: >-
+        ${{
+          needs.release.result == 'success'
+          && needs.check.outputs.release_tag
+          || needs.check.outputs.existing_release_tag
+        }}
+
+    steps:
+      - name: Checkout repository scripts and APT key
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts
+            apt
+
+      - name: Inspect the published APT repository
+        id: inspect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HAS_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY != '' }}
+        run: |
+          set -euo pipefail
+          export WORK_DIR="$RUNNER_TEMP/apt"
+          mkdir -p "$WORK_DIR"
+          echo "WORK_DIR=$WORK_DIR" >> "$GITHUB_ENV"
+
+          if [[ ! -s "$APT_PUBLIC_KEY" || "$HAS_SIGNING_KEY" != true ]]; then
+            echo "::notice::APT publishing is not configured yet: commit $APT_PUBLIC_KEY and add the APT_SIGNING_KEY secret (see README)."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! [[ "$KERNEL_RELEASE" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?(-(shouyu|cloud))?$ \
+            && "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?(-(shouyu|cloud))?(-[0-9]+)?$ ]]; then
+            echo "::error::Unsafe Release identity for the APT repository"
+            exit 1
+          fi
+
+          # The index must describe the exact bytes that the versioned
+          # Release serves to users.
+          release_json="$WORK_DIR/release.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            > "$release_json"
+          if ! jq -e '.draft == false and .prerelease == false' \
+            "$release_json" >/dev/null; then
+            echo "::error::$RELEASE_TAG is not a published final Release"
+            exit 1
+          fi
+          asset_digest() {
+            jq -r --arg name "$1" '
+              [.assets[] | select(.name == $name and .state == "uploaded")]
+              | if length == 1 then (.[0].digest // "") else "" end
+            ' "$release_json"
+          }
+          image_name="linux-image-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb"
+          headers_name="linux-headers-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb"
+          image_digest="$(asset_digest "$image_name")"
+          headers_digest="$(asset_digest "$headers_name")"
+          if ! [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ \
+            && "$headers_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::$RELEASE_TAG lacks uniquely named packages with SHA-256 digests"
+            exit 1
+          fi
+          export EXPECTED_IMAGE_SHA256="${image_digest#sha256:}"
+          export EXPECTED_HEADERS_SHA256="${headers_digest#sha256:}"
+          {
+            echo "EXPECTED_IMAGE_SHA256=$EXPECTED_IMAGE_SHA256"
+            echo "EXPECTED_HEADERS_SHA256=$EXPECTED_HEADERS_SHA256"
+            echo "IMAGE_NAME=$image_name"
+            echo "HEADERS_NAME=$headers_name"
+          } >> "$GITHUB_ENV"
+
+          inspect_status=0
+          bash .github/scripts/apt-repo.sh inspect || inspect_status=$?
+          case "$inspect_status" in
+            0) current=true ;;
+            10) current=false ;;
+            *) exit "$inspect_status" ;;
+          esac
+          {
+            echo "enabled=true"
+            echo "current=$current"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download the verified build packages
+        if: >-
+          steps.inspect.outputs.enabled == 'true' &&
+          steps.inspect.outputs.current != 'true' &&
+          env.FROM_BUILD == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kernel-packages-${{ github.run_id }}
+          path: ${{ runner.temp }}/apt-packages
+
+      - name: Download the published packages
+        if: >-
+          steps.inspect.outputs.enabled == 'true' &&
+          steps.inspect.outputs.current != 'true' &&
+          env.FROM_BUILD != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/apt-packages" \
+            --pattern "$IMAGE_NAME" \
+            --pattern "$HEADERS_NAME"
+
+      - name: Build and sign the APT index
+        if: >-
+          steps.inspect.outputs.enabled == 'true' &&
+          steps.inspect.outputs.current != 'true'
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          APT_SIGNING_KEY_PASSPHRASE: ${{ secrets.APT_SIGNING_KEY_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          # The private key exists only inside this step's throwaway keyring;
+          # the agent is stopped and the keyring wiped however the step ends.
+          export GNUPGHOME="$RUNNER_TEMP/apt-gnupg"
+          install -d -m 0700 "$GNUPGHOME"
+          trap 'gpgconf --kill all >/dev/null 2>&1 || true; rm -rf "$GNUPGHOME"' EXIT
+
+          mapfile -t key_fprs < <(
+            gpg --batch --with-colons --import-options show-only \
+              --import "$APT_PUBLIC_KEY" 2>/dev/null \
+              | awk -F: '$1 == "pub" { want = 1; next }
+                  want && $1 == "fpr" { print $10; want = 0 }'
+          )
+          if ((${#key_fprs[@]} != 1)) || [[ ! "${key_fprs[0]}" =~ ^[0-9A-F]{40}$ ]]; then
+            echo "::error::$APT_PUBLIC_KEY must contain exactly one public key"
+            exit 1
+          fi
+          signing_fpr="${key_fprs[0]}"
+
+          import=(gpg --batch --quiet --pinentry-mode loopback)
+          if [[ -n "${APT_SIGNING_KEY_PASSPHRASE:-}" ]]; then
+            passphrase_file="$GNUPGHOME/passphrase"
+            (umask 077 && printf '%s' "$APT_SIGNING_KEY_PASSPHRASE" > "$passphrase_file")
+            import+=(--passphrase-file "$passphrase_file")
+            export APT_SIGNING_PASSPHRASE_FILE="$passphrase_file"
+          fi
+          printf '%s\n' "$APT_SIGNING_KEY" | "${import[@]}" --import
+          secret_keys="$(
+            gpg --batch --with-colons --list-secret-keys "$signing_fpr" \
+              2>/dev/null || true
+          )"
+          if ! grep -q '^sec:' <<< "$secret_keys"; then
+            echo "::error::APT_SIGNING_KEY does not match $APT_PUBLIC_KEY ($signing_fpr)"
+            exit 1
+          fi
+
+          APT_SIGNING_FPR="$signing_fpr" \
+          PACKAGE_DIR="$RUNNER_TEMP/apt-packages" \
+          OUT_DIR="$RUNNER_TEMP/apt-out" \
+            bash .github/scripts/apt-repo.sh build
+
+      - name: Publish the APT index
+        if: >-
+          steps.inspect.outputs.enabled == 'true' &&
+          steps.inspect.outputs.current != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/apt-out"
+          apt_release_json="$WORK_DIR/apt-release.json"
+          apt_release_error="$WORK_DIR/apt-release.err"
+
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${APT_SUITE}" \
+            > "$apt_release_json" 2> "$apt_release_error"; then
+            # A prerelease can never become "latest", so the legacy installer
+            # and the kernel Release logic never mistake it for a kernel.
+            if ! jq -e '.draft == false and .prerelease == true' \
+              "$apt_release_json" >/dev/null; then
+              gh release edit "$APT_SUITE" \
+                --repo "$GITHUB_REPOSITORY" \
+                --draft=false \
+                --prerelease
+            fi
+          elif grep -q 'HTTP 404' "$apt_release_error"; then
+            notes_file="$WORK_DIR/apt-notes.md"
+            {
+              echo "Signed APT index for this project. Do not delete this Release."
+              echo
+              echo '```'
+              echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/shouyu-kernel.asc] https://github.com/${GITHUB_REPOSITORY}/releases/download/ ${APT_SUITE}/"
+              echo '```'
+            } > "$notes_file"
+            gh release create "$APT_SUITE" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "APT repository" \
+              --notes-file "$notes_file" \
+              --target "$(git rev-parse HEAD)" \
+              --prerelease
+          else
+            cat "$apt_release_error" >&2
+            echo "::error::Could not read the $APT_SUITE Release"
+            exit 1
+          fi
+
+          apt_release_id="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${APT_SUITE}" --jq '.id'
+          )"
+          assets_file="$WORK_DIR/apt-assets.tsv"
+          list_assets() {
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases/${apt_release_id}/assets?per_page=100" \
+              --jq '.[] | [(.id | tostring), .name, .created_at, (.digest // "")] | @tsv' \
+              > "$assets_file"
+          }
+          list_assets
+          declare -A published_digest=()
+          while IFS=$'\t' read -r asset_id asset_name created_at digest; do
+            published_digest["$asset_name"]="$digest"
+          done < "$assets_file"
+
+          # Meta-packages are built byte-identically, so an unchanged one
+          # keeps its existing asset instead of a delete-and-reupload gap.
+          uploads=()
+          for deb in "$out"/linux-image-shouyu_*_amd64.deb "$out"/linux-headers-shouyu_*_amd64.deb; do
+            digest="sha256:$(sha256sum "$deb" | awk '{ print $1 }')"
+            if [[ "${published_digest["$(basename "$deb")"]:-}" != "$digest" ]]; then
+              uploads+=("$deb")
+            fi
+          done
+
+          # Package files first, the signed metadata last, so a client that
+          # sees the new InRelease also finds the files it describes.
+          gh release upload "$APT_SUITE" --repo "$GITHUB_REPOSITORY" --clobber \
+            ${uploads[@]+"${uploads[@]}"} \
+            "$out/Packages" \
+            "$out/Packages.gz"
+          gh release upload "$APT_SUITE" --repo "$GITHUB_REPOSITORY" --clobber \
+            "$out/Release" \
+            "$out/Release.gpg"
+          gh release upload "$APT_SUITE" --repo "$GITHUB_REPOSITORY" --clobber \
+            "$out/InRelease"
+
+          # Clients that ran "apt update" before this publish still resolve the
+          # previous meta-packages, so a superseded meta-package stays until its
+          # replacement has been live for 30 days. Anything else that is no
+          # longer part of the index is removed right away.
+          retention_seconds=$((30 * 24 * 60 * 60))
+          now="$(date -u +%s)"
+          current_meta=("$out"/linux-image-shouyu_*_amd64.deb)
+          current_version="$(basename "${current_meta[0]}")"
+          current_version="${current_version#linux-image-shouyu_}"
+          current_version="${current_version%_amd64.deb}"
+          declare -A keep=()
+          for file in "$out"/*; do
+            keep["$(basename "$file")"]=1
+          done
+          declare -A meta_published_at=()
+          declare -A meta_asset_ids=()
+          list_assets
+          while IFS=$'\t' read -r asset_id asset_name created_at digest; do
+            if [[ "$asset_name" =~ ^linux-(image|headers)-shouyu_([0-9][0-9A-Za-z.+~-]*)_amd64\.deb$ ]]; then
+              version="${BASH_REMATCH[2]}"
+              published_at="$(date -u -d "$created_at" +%s)"
+              if [[ -z "${meta_published_at[$version]:-}" ]] \
+                || ((published_at < ${meta_published_at[$version]})); then
+                meta_published_at["$version"]="$published_at"
+              fi
+              [[ "$version" == "$current_version" ]] \
+                || meta_asset_ids["$version"]+="$asset_id "
+            elif [[ ! ${keep["$asset_name"]+present} ]]; then
+              echo "Removing obsolete APT asset $asset_name"
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" < /dev/null
+            fi
+          done < "$assets_file"
+          mapfile -t meta_versions < <(printf '%s\n' "${!meta_published_at[@]}" | sort -V)
+          for ((index = 0; index + 1 < ${#meta_versions[@]}; index++)); do
+            version="${meta_versions[index]}"
+            [[ -n "${meta_asset_ids[$version]:-}" ]] || continue
+            superseded_at="${meta_published_at[${meta_versions[index + 1]}]}"
+            if ((now - superseded_at < retention_seconds)); then
+              echo "Keeping superseded meta-packages $version for cached indexes"
+              continue
+            fi
+            for asset_id in ${meta_asset_ids[$version]}; do
+              echo "Removing expired meta-package asset $asset_id ($version)"
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+            done
+          done
+
+      - name: Verify the published APT repository end to end
+        if: >-
+          steps.inspect.outputs.enabled == 'true' &&
+          steps.inspect.outputs.current != 'true'
+        run: |
+          set -euo pipefail
+          verified=false
+          for attempt in 1 2 3 4 5; do
+            if bash .github/scripts/apt-repo.sh inspect --download-all; then
+              verified=true
+              break
+            fi
+            sleep "$((attempt * 5))"
+          done
+          [[ "$verified" == true ]] \
+            || { echo "::error::Published APT repository failed verification"; exit 1; }
+          {
+            echo "### APT repository"
+            echo
+            echo "- Kernel: \`$KERNEL_RELEASE\` from \`$RELEASE_TAG\`"
+            echo "- Source: \`deb https://github.com/${GITHUB_REPOSITORY}/releases/download/ ${APT_SUITE}/\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   telegram-notify:
     name: Notify Telegram of the result
     needs:
       - check
       - build
       - release
+      - apt-repository
     if: ${{ always() && needs.check.outputs.should_build == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -1692,7 +2242,8 @@ jobs:
           ${{
             needs.check.result == 'success' &&
             needs.build.result == 'success' &&
-            needs.release.result == 'success'
+            needs.release.result == 'success' &&
+            needs.apt-repository.result == 'success'
           }}
         continue-on-error: true
         env:
@@ -1762,7 +2313,8 @@ jobs:
             (
               needs.check.result != 'success' ||
               needs.build.result != 'success' ||
-              needs.release.result != 'success'
+              needs.release.result != 'success' ||
+              needs.apt-repository.result != 'success'
             )
           }}
         continue-on-error: true
@@ -1774,6 +2326,7 @@ jobs:
           CHECK_RESULT: ${{ needs.check.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           RELEASE_RESULT: ${{ needs.release.result }}
+          APT_RESULT: ${{ needs.apt-repository.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -1802,9 +2355,9 @@ jobs:
           fi
 
           message="$(printf \
-            '内核编译或发布失败\n目标版本：%s\n检查：%s\n编译：%s\n发布：%s\n运行记录：%s' \
+            '内核编译或发布失败\n目标版本：%s\n检查：%s\n编译：%s\n发布：%s\nAPT 仓库：%s\n运行记录：%s' \
             "$TARGET_VERSION" "$CHECK_RESULT" "$BUILD_RESULT" \
-            "$RELEASE_RESULT" "$RUN_URL")"
+            "$RELEASE_RESULT" "$APT_RESULT" "$RUN_URL")"
           request+=(--data-urlencode "text=$message")
           send_request=("${request[@]}")
           if [[ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]]; then

@@ -2207,13 +2207,16 @@ jobs:
           steps.inspect.outputs.current != 'true'
         run: |
           set -euo pipefail
+          # GitHub can take more than a minute before a newly created Release
+          # or a replaced asset is served under releases/download/, so allow
+          # up to eight minutes before declaring the publish broken.
           verified=false
-          for attempt in 1 2 3 4 5; do
+          for delay in 0 15 30 45 60 90 120 120; do
+            sleep "$delay"
             if bash .github/scripts/apt-repo.sh inspect --download-all; then
               verified=true
               break
             fi
-            sleep "$((attempt * 5))"
           done
           [[ "$verified" == true ]] \
             || { echo "::error::Published APT repository failed verification"; exit 1; }

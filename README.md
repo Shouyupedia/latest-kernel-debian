@@ -111,4 +111,4 @@ gh workflow run build-kernel.yml --repo Shouyupedia/latest-kernel-debian
 
 请把私钥另行离线备份，然后删除 `$GNUPGHOME`。如果私钥设置了口令，把口令保存为 secret `APT_SIGNING_KEY_PASSPHRASE`。
 
-工作流会创建一个名为 `apt` 的预发布 Release 存放签名索引（`InRelease`、`Packages` 等）和两个元包，内核包本身仍留在各版本的 Release 中，不会重复上传。请不要删除 `apt` Release。每次计划任务都会用 APT 自身校验已发布的仓库，发现缺失、过期或签名不符时自动重新签名并发布。更换密钥时，同时更新公钥文件和 secret 即可，下一次运行会自动用新密钥重新签名。
+工作流会创建一个名为 `apt` 的预发布 Release 存放签名索引（`InRelease`、`Packages` 等）和两个元包，内核包本身仍留在各版本的 Release 中，不会重复上传。旧版本的元包在被新版本取代后还会保留 30 天，让索引尚未刷新的客户端仍能完成安装。请不要删除 `apt` Release。每次计划任务都会用 APT 自身校验已发布的仓库，发现缺失、过期或签名不符时自动重新签名并发布。更换密钥时，同时更新公钥文件和 secret 即可，下一次运行会自动用新密钥重新签名。

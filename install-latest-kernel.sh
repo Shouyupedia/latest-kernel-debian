@@ -454,20 +454,33 @@ install_from_apt() {
         ["linux-headers-$kernel_release"]=1
     )
 
+    local -a kernel_packages=(
+        "linux-image-$kernel_release=$kernel_release-1"
+        "linux-headers-$kernel_release=$kernel_release-1"
+    )
+
     stage="模拟新内核安装"
-    simulate_install "${APT_META_PACKAGES[@]}"
+    simulate_install "${kernel_packages[@]}" "${APT_META_PACKAGES[@]}"
 
     stage="安装新内核"
     log "通过 APT 安装新内核..."
     set_rollback_packages \
         "linux-image-$kernel_release" \
-        "linux-headers-$kernel_release" \
-        "${APT_META_PACKAGES[@]}"
+        "linux-headers-$kernel_release"
+    # 这一步只装版本化内核包，元包等新内核通过全部校验后才升级
+    # （upgrade_apt_meta_packages）。如果元包已经依赖新内核，回滚删除新内核时
+    # APT 会连带删除元包，系统从此不再跟随升级。
     # 从这里开始，任何失败（包括 postinst 生成 initramfs 失败）都会先回滚
     # 本次新装的包、恢复 GRUB，然后再退出。
     rollback_enabled=true
+    run_apt install -y --no-install-recommends "${kernel_packages[@]}"
+}
+
+upgrade_apt_meta_packages() {
+    stage="更新 APT 元包"
+    log "更新元包 ${APT_META_PACKAGES[*]}..."
     run_apt install -y --no-install-recommends "${APT_META_PACKAGES[@]}"
-    # 版本化内核包由元包拉入并标记为自动安装；被新版本取代后，
+    # 版本化内核包改由元包拉入并标记为自动安装；被新版本取代后，
     # apt autoremove 会按 Debian 的规则（保留当前运行的与最新的两个内核）清理它们。
     run_root apt-mark auto \
         "linux-image-$kernel_release" "linux-headers-$kernel_release" >/dev/null \
@@ -749,6 +762,12 @@ ensure_grub_entry
 
 # 安装后校验全部通过，新内核可以确认能用，之后的失败不再回滚它。
 rollback_enabled=false
+
+# 必须在清理旧内核之前：旧元包仍依赖旧内核，先升级元包，清理时才不会
+# 把元包一起删掉。
+if [[ "$install_mode" == "apt" ]]; then
+    upgrade_apt_meta_packages
+fi
 
 stage="计算旧内核清理清单"
 # Build an exact cleanup allowlist from this project's historical Release

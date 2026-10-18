@@ -247,7 +247,12 @@ Description: $summary
  kernel releases automatically.
 EOF
     chmod 0644 "$tree/DEBIAN/control"
-    dpkg-deb --root-owner-group -Zxz --build "$tree" "$output" >/dev/null
+    # Byte-identical rebuilds: re-signing the same version (for example after
+    # a key rotation) must never change the file behind an already published
+    # URL, or clients holding the previous index would see a hash mismatch.
+    find "$tree" -exec touch --no-dereference --date=@0 {} +
+    SOURCE_DATE_EPOCH=0 \
+        dpkg-deb --root-owner-group -Zxz --build "$tree" "$output" >/dev/null
 }
 
 build() {

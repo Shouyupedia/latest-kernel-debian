@@ -2114,11 +2114,36 @@ jobs:
             exit 1
           fi
 
+          apt_release_id="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${APT_SUITE}" --jq '.id'
+          )"
+          assets_file="$WORK_DIR/apt-assets.tsv"
+          list_assets() {
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases/${apt_release_id}/assets?per_page=100" \
+              --jq '.[] | [(.id | tostring), .name, .created_at, (.digest // "")] | @tsv' \
+              > "$assets_file"
+          }
+          list_assets
+          declare -A published_digest=()
+          while IFS=$'\t' read -r asset_id asset_name created_at digest; do
+            published_digest["$asset_name"]="$digest"
+          done < "$assets_file"
+
+          # Meta-packages are built byte-identically, so an unchanged one
+          # keeps its existing asset instead of a delete-and-reupload gap.
+          uploads=()
+          for deb in "$out"/linux-image-shouyu_*_amd64.deb "$out"/linux-headers-shouyu_*_amd64.deb; do
+            digest="sha256:$(sha256sum "$deb" | awk '{ print $1 }')"
+            if [[ "${published_digest["$(basename "$deb")"]:-}" != "$digest" ]]; then
+              uploads+=("$deb")
+            fi
+          done
+
           # Package files first, the signed metadata last, so a client that
           # sees the new InRelease also finds the files it describes.
           gh release upload "$APT_SUITE" --repo "$GITHUB_REPOSITORY" --clobber \
-            "$out"/linux-image-shouyu_*_amd64.deb \
-            "$out"/linux-headers-shouyu_*_amd64.deb \
+            ${uploads[@]+"${uploads[@]}"} \
             "$out/Packages" \
             "$out/Packages.gz"
           gh release upload "$APT_SUITE" --repo "$GITHUB_REPOSITORY" --clobber \
@@ -2127,23 +2152,54 @@ jobs:
           gh release upload "$APT_SUITE" --repo "$GITHUB_REPOSITORY" --clobber \
             "$out/InRelease"
 
+          # Clients that ran "apt update" before this publish still resolve the
+          # previous meta-packages, so a superseded meta-package stays until its
+          # replacement has been live for 30 days. Anything else that is no
+          # longer part of the index is removed right away.
+          retention_seconds=$((30 * 24 * 60 * 60))
+          now="$(date -u +%s)"
+          current_meta=("$out"/linux-image-shouyu_*_amd64.deb)
+          current_version="$(basename "${current_meta[0]}")"
+          current_version="${current_version#linux-image-shouyu_}"
+          current_version="${current_version%_amd64.deb}"
           declare -A keep=()
           for file in "$out"/*; do
             keep["$(basename "$file")"]=1
           done
-          apt_release_id="$(
-            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${APT_SUITE}" --jq '.id'
-          )"
-          gh api --paginate \
-            "repos/${GITHUB_REPOSITORY}/releases/${apt_release_id}/assets?per_page=100" \
-            --jq '.[] | [(.id | tostring), .name] | @tsv' \
-            > "$WORK_DIR/apt-assets.tsv"
-          while IFS=$'\t' read -r asset_id asset_name; do
-            [[ ${keep["$asset_name"]+present} ]] && continue
-            echo "Removing obsolete APT asset $asset_name"
-            gh api --method DELETE \
-              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
-          done < "$WORK_DIR/apt-assets.tsv"
+          declare -A meta_published_at=()
+          declare -A meta_asset_ids=()
+          list_assets
+          while IFS=$'\t' read -r asset_id asset_name created_at digest; do
+            if [[ "$asset_name" =~ ^linux-(image|headers)-shouyu_([0-9][0-9A-Za-z.+~-]*)_amd64\.deb$ ]]; then
+              version="${BASH_REMATCH[2]}"
+              published_at="$(date -u -d "$created_at" +%s)"
+              if [[ -z "${meta_published_at[$version]:-}" ]] \
+                || ((published_at < ${meta_published_at[$version]})); then
+                meta_published_at["$version"]="$published_at"
+              fi
+              [[ "$version" == "$current_version" ]] \
+                || meta_asset_ids["$version"]+="$asset_id "
+            elif [[ ! ${keep["$asset_name"]+present} ]]; then
+              echo "Removing obsolete APT asset $asset_name"
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" < /dev/null
+            fi
+          done < "$assets_file"
+          mapfile -t meta_versions < <(printf '%s\n' "${!meta_published_at[@]}" | sort -V)
+          for ((index = 0; index + 1 < ${#meta_versions[@]}; index++)); do
+            version="${meta_versions[index]}"
+            [[ -n "${meta_asset_ids[$version]:-}" ]] || continue
+            superseded_at="${meta_published_at[${meta_versions[index + 1]}]}"
+            if ((now - superseded_at < retention_seconds)); then
+              echo "Keeping superseded meta-packages $version for cached indexes"
+              continue
+            fi
+            for asset_id in ${meta_asset_ids[$version]}; do
+              echo "Removing expired meta-package asset $asset_id ($version)"
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+            done
+          done
 
       - name: Verify the published APT repository end to end
         if: >-

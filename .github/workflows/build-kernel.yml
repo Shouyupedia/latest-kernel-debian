@@ -40,6 +40,8 @@ jobs:
       bbr3_branch: ${{ steps.bbr3-source.outputs.branch }}
       bbr3_commit_count: ${{ steps.bbr3-source.outputs.commit_count }}
       bbr3_tip: ${{ steps.bbr3-source.outputs.tip }}
+      build_arches: ${{ steps.version.outputs.build_arches }}
+      build_matrix: ${{ steps.version.outputs.build_matrix }}
       config_commit: ${{ steps.configs.outputs.config_commit }}
       configs_changed: ${{ steps.configs.outputs.configs_changed }}
       existing_kernel_release: ${{ steps.version.outputs.existing_kernel_release }}
@@ -76,11 +78,13 @@ jobs:
           git -C "$config_repo" sparse-checkout set --no-cone \
             /debian/config/config \
             /debian/config/amd64/config \
+            /debian/config/arm64/config \
             /debian/config/config.cloud \
             /debian/config/amd64/config.cloud-amd64
 
           base_config="$config_repo/debian/config/config"
           amd64_base_config="$config_repo/debian/config/amd64/config"
+          arm64_base_config="$config_repo/debian/config/arm64/config"
           common_config="$config_repo/debian/config/config.cloud"
           amd64_config="$config_repo/debian/config/amd64/config.cloud-amd64"
           snapshot_dir="$RUNNER_TEMP/kernel-configs"
@@ -112,15 +116,27 @@ jobs:
 
           validate_fragment "$base_config" config 10000 100
           validate_fragment "$amd64_base_config" config.amd64 500 5
+          validate_fragment "$arm64_base_config" config.arm64 10000 500
           validate_fragment "$common_config" config.cloud 10000 100
           validate_fragment "$amd64_config" config.cloud-amd64 500 10
 
+          # Debian's fragments plus this project's overlays, exactly as the
+          # build jobs will merge them. The amd64 VPS kernel uses the cloud
+          # fragments; the Orange Pi Zero 2 kernel uses Debian's generic arm64
+          # fragment. config.common is shared by both.
           mkdir -p "$snapshot_dir"
           install -m 0644 "$base_config" "$snapshot_dir/config.debian"
           install -m 0644 "$amd64_base_config" "$snapshot_dir/config.amd64"
+          install -m 0644 "$arm64_base_config" "$snapshot_dir/config.arm64"
           install -m 0644 "$common_config" "$snapshot_dir/config.cloud"
           install -m 0644 "$amd64_config" "$snapshot_dir/config.cloud-amd64"
-          install -m 0644 "$GITHUB_WORKSPACE/config.vps" "$snapshot_dir/config.vps"
+          for overlay in config.common config.vps config.orangepi-zero2; do
+            if [[ ! -s "$GITHUB_WORKSPACE/$overlay" ]]; then
+              echo "::error::Missing project config overlay: $overlay"
+              exit 1
+            fi
+            install -m 0644 "$GITHUB_WORKSPACE/$overlay" "$snapshot_dir/$overlay"
+          done
 
           install -m 0644 "$common_config" "$GITHUB_WORKSPACE/config.cloud"
           install -m 0644 "$amd64_config" "$GITHUB_WORKSPACE/config.cloud-amd64"
@@ -223,10 +239,21 @@ jobs:
             version="${version}.0"
           fi
           release_tag="v${version}-shouyu"
+          # Every architecture this project builds, with the GitHub-hosted
+          # runner that compiles it natively. Each architecture is decided on
+          # its own: a Release that already carries one of them only gets the
+          # missing one added, and one failing build never blocks the other.
+          declare -A arch_runners=(
+            [amd64]=ubuntu-24.04
+            [arm64]=ubuntu-24.04-arm
+          )
+          declare -a arches=(amd64 arm64)
+          declare -a build_arches=()
           existing_release=""
           existing_kernel_release=""
           declare -A candidate_releases=()
           declare -A candidate_kernel_releases=()
+          # Keyed by "<tag>/<arch>".
           declare -A release_images=()
           declare -A release_headers=()
           declare -a candidate_order=()
@@ -281,47 +308,76 @@ jobs:
             fi
             candidate_releases["$published_tag"]=1
             candidate_kernel_releases["$published_tag"]="$package_release"
-            if [[ "$asset_name" == \
-              "linux-image-${package_release}_${package_release}-1_amd64.deb" ]]; then
-              release_images["$published_tag"]=1
-            elif [[ "$asset_name" == \
-              "linux-headers-${package_release}_${package_release}-1_amd64.deb" ]]; then
-              release_headers["$published_tag"]=1
-            fi
+            for arch in "${arches[@]}"; do
+              if [[ "$asset_name" == \
+                "linux-image-${package_release}_${package_release}-1_${arch}.deb" ]]; then
+                release_images["$published_tag/$arch"]=1
+              elif [[ "$asset_name" == \
+                "linux-headers-${package_release}_${package_release}-1_${arch}.deb" ]]; then
+                release_headers["$published_tag/$arch"]=1
+              fi
+            done
           done < "$release_assets_file"
 
           complete_release() {
             local candidate="$1"
-            [[ ${release_images["$candidate"]+present} \
-              && ${release_headers["$candidate"]+present} ]]
+            local arch="$2"
+            [[ ${release_images["$candidate/$arch"]+present} \
+              && ${release_headers["$candidate/$arch"]+present} ]]
           }
 
           if [[ ${candidate_releases["$release_tag"]+present} ]]; then
-            if complete_release "$release_tag"; then
+            # The current Release naming is in use for this version: every
+            # architecture whose package pair is missing gets (re)built and
+            # added to that Release.
+            for arch in "${arches[@]}"; do
+              complete_release "$release_tag" "$arch" \
+                || build_arches+=("$arch")
+            done
+            if ((${#build_arches[@]} < ${#arches[@]})); then
               existing_release="$release_tag"
             fi
-          elif complete_release "$latest_tag"; then
-            existing_release="$latest_tag"
           else
-            for published_tag in "${candidate_order[@]}"; do
-              if complete_release "$published_tag"; then
-                existing_release="$published_tag"
-                break
-              fi
-            done
+            # Legacy Release names predate the arm64 kernel and only ever
+            # carried amd64 packages. A complete legacy Release still counts
+            # as "already built" so that old history is never rebuilt.
+            if complete_release "$latest_tag" amd64; then
+              existing_release="$latest_tag"
+            else
+              for published_tag in "${candidate_order[@]}"; do
+                if complete_release "$published_tag" amd64; then
+                  existing_release="$published_tag"
+                  break
+                fi
+              done
+            fi
+            if [[ -z "$existing_release" ]]; then
+              build_arches=("${arches[@]}")
+            fi
           fi
 
           if [[ -n "$existing_release" ]]; then
             existing_kernel_release="${candidate_kernel_releases[$existing_release]}"
           fi
 
-          should_build=true
-          if [[ -n "$existing_release" ]]; then
-            should_build=false
-            echo "Kernel source $latest_tag was already built in release $existing_release."
+          should_build=false
+          if ((${#build_arches[@]} > 0)); then
+            should_build=true
+            echo "Kernel source $latest_tag will be built as $release_tag for: ${build_arches[*]}"
           else
-            echo "Kernel source $latest_tag is new and will be built as $release_tag."
+            echo "Kernel source $latest_tag was already built in release $existing_release."
           fi
+          build_matrix="$(
+            for arch in "${build_arches[@]}"; do
+              printf '%s\t%s\n' "$arch" "${arch_runners[$arch]}"
+            done \
+              | jq -R -s -c '
+                split("\n")
+                | map(select(length > 0) | split("\t")
+                  | { arch: .[0], runner: .[1] })
+                | { include: . }
+              '
+          )"
 
           {
             echo "source_tag=$latest_tag"
@@ -331,6 +387,8 @@ jobs:
             echo "existing_release_tag=$existing_release"
             echo "existing_kernel_release=$existing_kernel_release"
             echo "should_build=$should_build"
+            echo "build_arches=${build_arches[*]}"
+            echo "build_matrix=$build_matrix"
           } >> "$GITHUB_OUTPUT"
 
           {
@@ -341,6 +399,7 @@ jobs:
             echo "- New Release tag: \`$release_tag\`"
             echo "- Existing complete Release: \`${existing_release:-none}\`"
             echo "- Build required: \`$should_build\`"
+            echo "- Architectures to build: \`${build_arches[*]:-none}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Resolve BBRv3 source
@@ -580,48 +639,67 @@ jobs:
             exit 1
           fi
 
+          # Package assets are keyed by "<kind>/<arch>". An architecture is
+          # published when both of its packages are present; a lone package
+          # is an inconsistent upload and stops the job.
+          arches=(amd64 arm64)
           declare -A asset_id=()
           declare -A asset_name=()
           declare -A asset_digest=()
           declare -A asset_size=()
           declare -A asset_created=()
           declare -a extra_asset_ids=()
+          declare -a present_arches=()
+          declare -a present_keys=()
 
           while IFS=$'\t' read -r id name state digest size created_at; do
-            kind=""
-            case "$name" in
-              "linux-image-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb")
-                kind=image
-                ;;
-              "linux-headers-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb")
-                kind=headers
-                ;;
-              *)
-                extra_asset_ids+=("$id")
-                continue
-                ;;
-            esac
+            key=""
+            for arch in "${arches[@]}"; do
+              case "$name" in
+                "linux-image-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_${arch}.deb")
+                  key="image/$arch"
+                  ;;
+                "linux-headers-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_${arch}.deb")
+                  key="headers/$arch"
+                  ;;
+              esac
+              [[ -z "$key" ]] || break
+            done
+            if [[ -z "$key" ]]; then
+              extra_asset_ids+=("$id")
+              continue
+            fi
 
             if [[ "$state" != "uploaded" \
-              || ! "$name" =~ ^linux-(image|headers)-[A-Za-z0-9.+~-]+_[A-Za-z0-9.+:~-]+_amd64\.deb$ \
+              || ! "$name" =~ ^linux-(image|headers)-[A-Za-z0-9.+~-]+_[A-Za-z0-9.+:~-]+_(amd64|arm64)\.deb$ \
               || ! "$size" =~ ^[1-9][0-9]*$ \
-              || ${asset_id["$kind"]+present} ]]; then
-              echo "::error::Invalid or duplicate $kind asset in $RELEASE_TAG"
+              || ${asset_id["$key"]+present} ]]; then
+              echo "::error::Invalid or duplicate $key asset in $RELEASE_TAG"
               exit 1
             fi
-            asset_id["$kind"]="$id"
-            asset_name["$kind"]="$name"
-            asset_digest["$kind"]="$digest"
-            asset_size["$kind"]="$size"
-            asset_created["$kind"]="$created_at"
+            asset_id["$key"]="$id"
+            asset_name["$key"]="$name"
+            asset_digest["$key"]="$digest"
+            asset_size["$key"]="$size"
+            asset_created["$key"]="$created_at"
           done < "$assets_file"
 
-          for kind in image headers; do
-            if [[ ! ${asset_id["$kind"]+present} ]]; then
-              echo "::error::Existing Release is missing its $kind package"
+          for arch in "${arches[@]}"; do
+            if [[ ${asset_id["image/$arch"]+present} \
+              && ${asset_id["headers/$arch"]+present} ]]; then
+              present_arches+=("$arch")
+              present_keys+=("image/$arch" "headers/$arch")
+            elif [[ ${asset_id["image/$arch"]+present} \
+              || ${asset_id["headers/$arch"]+present} ]]; then
+              echo "::error::Existing Release has an incomplete $arch package pair"
               exit 1
             fi
           done
+          if ((${#present_arches[@]} == 0)); then
+            echo "::error::Existing Release has no complete package pair"
+            exit 1
+          fi
+          echo "Published architectures in $RELEASE_TAG: ${present_arches[*]}"
 
           existing_body="$(jq -r '.body // ""' "$release_json")"
           build_time="$(
@@ -631,10 +709,12 @@ jobs:
               || true
           )"
           if [[ -z "$build_time" ]]; then
-            build_time="${asset_created[image]}"
-            if [[ "${asset_created[headers]}" < "$build_time" ]]; then
-              build_time="${asset_created[headers]}"
-            fi
+            for key in "${present_keys[@]}"; do
+              if [[ -z "$build_time" \
+                || "${asset_created[$key]}" < "$build_time" ]]; then
+                build_time="${asset_created[$key]}"
+              fi
+            done
           fi
           if ! [[ "$build_time" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
             echo "::error::Could not determine the original UTC build time"
@@ -652,8 +732,8 @@ jobs:
           # an already normalized Release untouched instead of rewriting its
           # notes and assets every three hours.
           already_normalized=true
-          for kind in image headers; do
-            [[ "${asset_digest[$kind]}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+          for key in "${present_keys[@]}"; do
+            [[ "${asset_digest[$key]}" =~ ^sha256:[0-9a-f]{64}$ ]] \
               || already_normalized=false
           done
           ((${#extra_asset_ids[@]} == 0)) || already_normalized=false
@@ -675,15 +755,17 @@ jobs:
           # is performed.
           refresh_dir="$RUNNER_TEMP/release-refresh"
           mkdir -p "$refresh_dir"
-          for kind in image headers; do
-            [[ "${asset_digest[$kind]}" =~ ^sha256:[0-9a-f]{64}$ ]] && continue
+          for key in "${present_keys[@]}"; do
+            [[ "${asset_digest[$key]}" =~ ^sha256:[0-9a-f]{64}$ ]] && continue
+            kind="${key%/*}"
+            arch="${key#*/}"
 
-            package_path="$refresh_dir/${asset_name[$kind]}"
+            package_path="$refresh_dir/${asset_name[$key]}"
             if ! gh api \
               -H "Accept: application/octet-stream" \
-              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id[$kind]}" \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id[$key]}" \
               > "${package_path}.part"; then
-              echo "::error::Could not download the existing $kind asset"
+              echo "::error::Could not download the existing $key asset"
               exit 1
             fi
             mv "${package_path}.part" "$package_path"
@@ -693,22 +775,22 @@ jobs:
             architecture="$(dpkg-deb -f "$package_path" Architecture)"
             expected_package="linux-${kind}-${KERNEL_RELEASE}"
             if [[ "$package" != "$expected_package" ]]; then
-              echo "::error::Unexpected package name in existing $kind asset"
+              echo "::error::Unexpected package name in existing $key asset"
               exit 1
             fi
-            if [[ "$version" != "${KERNEL_RELEASE}-1" || "$architecture" != "amd64" ]]; then
-              echo "::error::Unexpected package metadata in existing $kind asset"
+            if [[ "$version" != "${KERNEL_RELEASE}-1" || "$architecture" != "$arch" ]]; then
+              echo "::error::Unexpected package metadata in existing $key asset"
               exit 1
             fi
             actual_size="$(stat -c '%s' "$package_path")"
-            if [[ "$actual_size" != "${asset_size[$kind]}" ]]; then
-              echo "::error::Existing $kind asset size changed during download"
+            if [[ "$actual_size" != "${asset_size[$key]}" ]]; then
+              echo "::error::Existing $key asset size changed during download"
               exit 1
             fi
 
             gh api \
               --method DELETE \
-              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id[$kind]}"
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id[$key]}"
             gh release upload \
               "$RELEASE_TAG" \
               "$package_path" \
@@ -771,32 +853,30 @@ jobs:
             fi
             mapfile -t final_assets < "$final_assets_file"
             assets_valid=true
-            if ((${#final_assets[@]} != 2)); then
+            declare -A found_keys=()
+            if ((${#final_assets[@]} != ${#present_keys[@]})); then
               assets_valid=false
             else
-              found_image=false
-              found_headers=false
               for record in "${final_assets[@]}"; do
                 IFS=$'\t' read -r name state digest size <<< "$record"
-                case "$name" in
-                  "linux-image-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb")
-                    found_image=true
-                    ;;
-                  "linux-headers-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb")
-                    found_headers=true
-                    ;;
-                  *)
-                    assets_valid=false
-                    ;;
-                esac
+                found=false
+                for key in "${present_keys[@]}"; do
+                  if [[ "$name" == "${asset_name[$key]}" ]]; then
+                    found_keys["$key"]=1
+                    found=true
+                    break
+                  fi
+                done
+                [[ "$found" == true ]] || assets_valid=false
                 if [[ "$state" != "uploaded" \
                   || ! "$digest" =~ ^sha256:[0-9a-f]{64}$ \
                   || ! "$size" =~ ^[1-9][0-9]*$ ]]; then
                   assets_valid=false
                 fi
               done
-              [[ "$found_image" == true && "$found_headers" == true ]] \
-                || assets_valid=false
+              for key in "${present_keys[@]}"; do
+                [[ ${found_keys["$key"]+present} ]] || assets_valid=false
+              done
             fi
 
             if [[ "$actual_name" == "$KERNEL_RELEASE" \
@@ -811,30 +891,16 @@ jobs:
           [[ "$verified" == true ]] \
             || { echo "::error::Normalized Release verification failed"; exit 1; }
 
-  build:
-    name: Build ${{ needs.check.outputs.source_tag }}
+  notify-start:
+    name: Notify Telegram that the build started
     needs: check
     if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    outputs:
-      build_time: ${{ steps.metadata.outputs.build_time }}
-      kernel_release: ${{ steps.krel.outputs.release }}
-    permissions:
-      contents: read
-    env:
-      # A defined LOCALVERSION suppresses the SCM "+" added after the BBRv3
-      # commits, while remaining inherited by bindeb-pkg's recursive make.
-      LOCALVERSION: "-shouyu"
-      # Stable identity for /proc/version and the package Maintainer field
-      # instead of the ephemeral runner hostname.
-      KBUILD_BUILD_USER: shouyu
-      KBUILD_BUILD_HOST: github-actions
-      DEBFULLNAME: Kernel Builder
-      DEBEMAIL: kernel-builder@users.noreply.github.com
+    timeout-minutes: 5
+    permissions: {}
 
     steps:
-      - name: Notify Telegram that the build started
+      - name: Send the notification
         continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -842,6 +908,7 @@ jobs:
           TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
           SOURCE_TAG: ${{ needs.check.outputs.source_tag }}
           TARGET_VERSION: ${{ needs.check.outputs.version }}-shouyu
+          BUILD_ARCHES: ${{ needs.check.outputs.build_arches }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -870,8 +937,8 @@ jobs:
           fi
 
           message="$(printf \
-            '发现新的 Linux stable 内核：%s\n目标版本：%s\n状态：已开始编译\n运行记录：%s' \
-            "$SOURCE_TAG" "$TARGET_VERSION" "$RUN_URL")"
+            '发现新的 Linux stable 内核：%s\n目标版本：%s\n架构：%s\n状态：已开始编译\n运行记录：%s' \
+            "$SOURCE_TAG" "$TARGET_VERSION" "$BUILD_ARCHES" "$RUN_URL")"
           request+=(--data-urlencode "text=$message")
           send_request=("${request[@]}")
           if [[ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]]; then
@@ -895,6 +962,35 @@ jobs:
           echo "::warning::Telegram notification failed: ${description:-no API description}"
           exit 0
 
+  build:
+    name: Build ${{ needs.check.outputs.source_tag }} for ${{ matrix.arch }}
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    strategy:
+      # One architecture failing must not cancel or hide the other: the
+      # release job publishes whatever was built and the next scheduled run
+      # retries only the missing architecture.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.check.outputs.build_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      # Debian architecture of this matrix leg; the kernel is compiled
+      # natively on a runner of that architecture, so ARCH is never set.
+      DEB_ARCH: ${{ matrix.arch }}
+      # A defined LOCALVERSION suppresses the SCM "+" added after the BBRv3
+      # commits, while remaining inherited by bindeb-pkg's recursive make.
+      LOCALVERSION: "-shouyu"
+      # Stable identity for /proc/version and the package Maintainer field
+      # instead of the ephemeral runner hostname.
+      KBUILD_BUILD_USER: shouyu
+      KBUILD_BUILD_HOST: github-actions
+      DEBFULLNAME: Kernel Builder
+      DEBEMAIL: kernel-builder@users.noreply.github.com
+
+    steps:
       - name: Free disk space
         run: |
           set -euo pipefail
@@ -941,9 +1037,12 @@ jobs:
             echo "CCACHE_DIR=$RUNNER_TEMP/ccache"
             echo "CCACHE_MAXSIZE=2G"
           } >> "$GITHUB_ENV"
+          # Caches are per architecture: an amd64 object cache is useless to
+          # the arm64 compiler and would only evict its entries.
           {
-            echo "key=ccache-v1-${KERNEL_VERSION}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-            echo "series_prefix=ccache-v1-${series}."
+            echo "key=ccache-v2-${DEB_ARCH}-${KERNEL_VERSION}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "series_prefix=ccache-v2-${DEB_ARCH}-${series}."
+            echo "arch_prefix=ccache-v2-${DEB_ARCH}-"
           } >> "$GITHUB_OUTPUT"
 
       - name: Restore compiler cache
@@ -953,7 +1052,7 @@ jobs:
           key: ${{ steps.ccache.outputs.key }}
           restore-keys: |
             ${{ steps.ccache.outputs.series_prefix }}
-            ccache-v1-
+            ${{ steps.ccache.outputs.arch_prefix }}
 
       - name: Download current kernel config snapshot
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -1236,27 +1335,37 @@ jobs:
           set -euxo pipefail
           cd /tmp/linux
 
-          # Reproduce Debian's four cloud-amd64 layers. The project overlay is
-          # deliberately last so required VPS and container features win over
-          # Debian's hardware trimming.
-          for fragment in \
-            config.debian \
-            config.amd64 \
-            config.cloud \
-            config.cloud-amd64 \
-            config.vps; do
+          # Debian's fragments first, this project's overlays last so that
+          # required features win over Debian's hardware trimming. The amd64
+          # VPS kernel reproduces Debian's four cloud-amd64 layers; the
+          # Orange Pi Zero 2 kernel starts from Debian's generic arm64 kernel.
+          case "$DEB_ARCH" in
+            amd64)
+              fragments=(config.debian config.amd64 config.cloud config.cloud-amd64)
+              overlays=(config.common config.vps)
+              ;;
+            arm64)
+              fragments=(config.debian config.arm64)
+              overlays=(config.common config.orangepi-zero2)
+              ;;
+            *)
+              echo "::error::Unsupported architecture: $DEB_ARCH"
+              exit 1
+              ;;
+          esac
+          for fragment in "${fragments[@]}" "${overlays[@]}"; do
             if [[ ! -s "$GITHUB_WORKSPACE/$fragment" ]]; then
               echo "::error::Missing kernel config fragment: $fragment"
               exit 1
             fi
           done
 
-          cp "$GITHUB_WORKSPACE/config.debian" .config
-          scripts/kconfig/merge_config.sh -m .config \
-            "$GITHUB_WORKSPACE/config.amd64" \
-            "$GITHUB_WORKSPACE/config.cloud" \
-            "$GITHUB_WORKSPACE/config.cloud-amd64" \
-            "$GITHUB_WORKSPACE/config.vps"
+          merge_inputs=()
+          for fragment in "${fragments[@]:1}" "${overlays[@]}"; do
+            merge_inputs+=("$GITHUB_WORKSPACE/$fragment")
+          done
+          cp "$GITHUB_WORKSPACE/${fragments[0]}" .config
+          scripts/kconfig/merge_config.sh -m .config "${merge_inputs[@]}"
 
           KCONFIG_WARN_UNKNOWN_SYMBOLS=1 \
           KCONFIG_WARN_CHANGED_INPUT=1 \
@@ -1318,54 +1427,51 @@ jobs:
             fi
           }
 
-          while IFS= read -r requested_setting; do
-            if [[ ! "$requested_setting" =~ ^CONFIG_[A-Z0-9_]+= \
-              && ! "$requested_setting" =~ ^#\ CONFIG_[A-Z0-9_]+\ is\ not\ set$ ]]; then
-              continue
-            fi
-            if [[ "$requested_setting" =~ ^#\ CONFIG_([A-Z0-9_]+)\ is\ not\ set$ ]]; then
-              requested_symbol="${BASH_REMATCH[1]}"
-              if grep -qxF "$requested_setting" .config; then
+          for overlay in "${overlays[@]}"; do
+            while IFS= read -r requested_setting; do
+              if [[ ! "$requested_setting" =~ ^CONFIG_[A-Z0-9_]+= \
+                && ! "$requested_setting" =~ ^#\ CONFIG_[A-Z0-9_]+\ is\ not\ set$ ]]; then
                 continue
-              elif ! kconfig_symbol_exists "$requested_symbol"; then
-                echo "::error::Unknown overlay symbol: CONFIG_$requested_symbol"
-                fail=1
-              elif grep -q "^CONFIG_${requested_symbol}=" .config; then
+              fi
+              if [[ "$requested_setting" =~ ^#\ CONFIG_([A-Z0-9_]+)\ is\ not\ set$ ]]; then
+                requested_symbol="${BASH_REMATCH[1]}"
+                if grep -qxF "$requested_setting" .config; then
+                  continue
+                elif ! kconfig_symbol_exists "$requested_symbol"; then
+                  echo "::error::Unknown overlay symbol: CONFIG_$requested_symbol"
+                  fail=1
+                elif grep -q "^CONFIG_${requested_symbol}=" .config; then
+                  echo "::error::Overlay request was not honored: $requested_setting"
+                  fail=1
+                fi
+              elif ! grep -qxF "$requested_setting" .config; then
                 echo "::error::Overlay request was not honored: $requested_setting"
                 fail=1
               fi
-            elif ! grep -qxF "$requested_setting" .config; then
-              echo "::error::Overlay request was not honored: $requested_setting"
-              fail=1
-            fi
-          done < "$GITHUB_WORKSPACE/config.vps"
+            done < "$GITHUB_WORKSPACE/$overlay"
+          done
 
+          # Shared requirements, then what each target must provide.
           required_builtin=(
-            X86_64 SMP PREEMPT_LAZY PCI PCI_MSI ACPI BLK_DEV_INITRD
+            SMP PREEMPT_LAZY BLK_DEV_INITRD
             DEVTMPFS DEVTMPFS_MOUNT PROC_FS SYSFS TMPFS EFI EFI_STUB
             SERIAL_8250 SERIAL_8250_CONSOLE
             MODULES MODULE_UNLOAD MODULE_COMPRESS_ZSTD MODULE_DECOMPRESS
             MODULE_SIG SCSI
             PACKET UNIX INET IPV6 NET_SCHED NET_SCH_FQ DEFAULT_FQ
-            TCP_CONG_CUBIC TCP_CONG_BBR DEFAULT_BBR
-            HYPERVISOR_GUEST PARAVIRT VIRTIO VIRTIO_PCI EXT4_FS
+            TCP_CONG_CUBIC TCP_CONG_BBR DEFAULT_BBR EXT4_FS
             NAMESPACES NET_NS PID_NS IPC_NS UTS_NS USER_NS
             CGROUPS CGROUP_CPUACCT CGROUP_DEVICE CGROUP_FREEZER
             CGROUP_SCHED CGROUP_PIDS CGROUP_BPF CPUSETS MEMCG
             BLK_CGROUP BLK_DEV_THROTTLING FAIR_GROUP_SCHED CFS_BANDWIDTH
             KEYS SECCOMP SECCOMP_FILTER POSIX_MQUEUE BPF BPF_SYSCALL
-            NETFILTER
+            NETFILTER NETFILTER_XTABLES_LEGACY
           )
           required_modules=(
-            TCP_CONG_BBR3 VIRTIO_BLK SCSI_VIRTIO VIRTIO_NET
-            VIRTIO_CONSOLE VIRTIO_BALLOON HW_RANDOM_VIRTIO
-            XEN_BLKDEV_FRONTEND XEN_NETDEV_FRONTEND
-            HYPERV_STORAGE HYPERV_NET VMWARE_PVSCSI VMXNET3
-            E1000 E1000E ENA_ETHERNET GVE MICROSOFT_MANA I40EVF
+            TCP_CONG_BBR3
           )
           required_enabled=(
-            BLK_DEV_SD SATA_AHCI ATA_PIIX BLK_DEV_NVME
-            XEN HYPERV OVERLAY_FS XFS_FS BTRFS_FS FUSE_FS
+            BLK_DEV_SD OVERLAY_FS XFS_FS BTRFS_FS FUSE_FS
             TUN VETH BRIDGE BRIDGE_NETFILTER VXLAN IPVLAN MACVLAN
             NF_CONNTRACK NF_NAT NF_TABLES NFT_CT NFT_NAT NFT_MASQ
             NETFILTER_XT_MARK NETFILTER_XT_MATCH_ADDRTYPE
@@ -1382,6 +1488,84 @@ jobs:
             IP_NF_TARGET_REJECT IP6_NF_TARGET_REJECT
             VLAN_8021Q OPENVSWITCH MPLS
           )
+          case "$DEB_ARCH" in
+            amd64)
+              required_builtin+=(
+                X86_64 PCI PCI_MSI ACPI
+                HYPERVISOR_GUEST PARAVIRT VIRTIO VIRTIO_PCI
+              )
+              required_modules+=(
+                VIRTIO_BLK SCSI_VIRTIO VIRTIO_NET
+                VIRTIO_CONSOLE VIRTIO_BALLOON HW_RANDOM_VIRTIO
+                XEN_BLKDEV_FRONTEND XEN_NETDEV_FRONTEND
+                HYPERV_STORAGE HYPERV_NET VMWARE_PVSCSI VMXNET3
+                E1000 E1000E ENA_ETHERNET GVE MICROSOFT_MANA I40EVF
+              )
+              required_enabled+=(
+                SATA_AHCI ATA_PIIX BLK_DEV_NVME XEN HYPERV
+              )
+              check_value NR_CPUS 256
+              ;;
+            arm64)
+              # Allwinner H616: everything on the path to the SD card root
+              # filesystem is built in, the rest of the board is modular.
+              required_builtin+=(
+                ARM64 ARCH_SUNXI
+                SUNXI_CCU SUN50I_H616_CCU SUN50I_H6_R_CCU SUN6I_RTC_CCU
+                PINCTRL_SUN50I_H616 PINCTRL_SUN50I_H616_R
+                SUNXI_SRAM RESET_SUNXI SUN6I_R_INTC SUNXI_NMI_INTC
+                DMA_SUN6I SUN50I_IOMMU SUN50I_H6_PRCM_PPU
+                RTC_DRV_SUN6I NVMEM_SUNXI_SID
+                SERIAL_8250_DW MMC MMC_BLOCK MMC_SUNXI
+                SUNXI_RSB I2C I2C_MV64XXX MFD_AXP20X_RSB MFD_AXP20X_I2C
+                REGULATOR REGULATOR_FIXED_VOLTAGE REGULATOR_AXP20X
+                CPU_FREQ CPU_FREQ_DEFAULT_GOV_SCHEDUTIL CPUFREQ_DT
+                ARM_ALLWINNER_SUN50I_CPUFREQ_NVMEM
+                THERMAL CPU_THERMAL SUN8I_THERMAL
+                CMA DMA_CMA USB USB_EHCI_HCD USB_OHCI_HCD INPUT_EVDEV
+                GPIO_CDEV GPIO_SYSFS SPI PWM LEDS_CLASS
+                VFAT_FS NLS_CODEPAGE_437 NLS_ISO8859_1 NLS_UTF8
+                SWAP ZSWAP ZSMALLOC
+              )
+              required_modules+=(
+                STMMAC_ETH STMMAC_PLATFORM DWMAC_SUN8I MOTORCOMM_PHY
+                PHY_SUN4I_USB USB_EHCI_HCD_PLATFORM USB_OHCI_HCD_PLATFORM
+                USB_MUSB_HDRC USB_MUSB_SUNXI USB_STORAGE
+                SUNXI_WATCHDOG INPUT_AXP20X_PEK
+                SND_SUN4I_CODEC SND_SUN4I_I2S SND_SUN4I_SPDIF
+                SND_SUN50I_DMIC SND_SIMPLE_CARD
+                DRM_PANFROST DRM_SUN4I DRM_SUN8I_MIXER DRM_SUN8I_DW_HDMI
+                SPI_SUN6I SPI_SPIDEV I2C_CHARDEV PWM_SUN4I LEDS_GPIO
+                MTD_SPI_NOR SUN20I_GPADC KEYBOARD_SUN4I_LRADC
+                CRYPTO_DEV_SUN8I_CE IR_SUNXI ZRAM F2FS_FS
+              )
+              required_enabled+=(
+                USB_HID HID_GENERIC CFG80211 MAC80211 BT
+                SND SND_SOC DRM MTD IIO RC_CORE MEDIA_SUPPORT
+              )
+              check_value NR_CPUS 8
+              # No bus or firmware interface the board lacks, and no
+              # hypervisor code on a single-board computer.
+              for symbol in PCI ACPI ARM_SMMU ARM_SMMU_V3 \
+                VIRTUALIZATION KVM XEN HYPERV \
+                COMPRESSED_INSTALL EFI_ZBOOT; do
+                check_not_enabled "$symbol"
+              done
+              # Debian enables every arm64 platform; only Allwinner may stay
+              # on. A newly added platform fails here until the overlay
+              # disables it too.
+              while IFS= read -r platform; do
+                [[ "$platform" == ARCH_SUNXI ]] && continue
+                if grep -qxF "CONFIG_${platform}=y" .config; then
+                  echo "::error::Unexpected arm64 platform enabled: CONFIG_$platform"
+                  fail=1
+                fi
+              done < <(
+                grep -oE '^(menu)?config ARCH_[A-Z0-9_]+' arch/arm64/Kconfig.platforms \
+                  | awk '{ print $2 }'
+              )
+              ;;
+          esac
 
           for symbol in "${required_builtin[@]}"; do
             check_builtin "$symbol"
@@ -1394,7 +1578,6 @@ jobs:
           done
 
           check_value LOCALVERSION '""'
-          check_value NR_CPUS 256
           check_value HZ 250
           check_value DEFAULT_TCP_CONG '"bbr"'
           check_value DEFAULT_NET_SCH '"fq"'
@@ -1437,7 +1620,7 @@ jobs:
           # --root-owner-group), so the compile does not run under fakeroot's
           # LD_PRELOAD, which serializes every stat() through faked.
           make -j"$(nproc)" bindeb-pkg \
-            KBUILD_DEBARCH=amd64 \
+            KBUILD_DEBARCH="$DEB_ARCH" \
             KDEB_PKGVERSION="${KREL}-1"
           {
             echo "### Compiler cache"
@@ -1481,8 +1664,8 @@ jobs:
         run: |
           set -euxo pipefail
           shopt -s nullglob
-          image_packages=(/tmp/"linux-image-${krel}_"*"_amd64.deb")
-          header_packages=(/tmp/"linux-headers-${krel}_"*"_amd64.deb")
+          image_packages=(/tmp/"linux-image-${krel}_"*"_${DEB_ARCH}.deb")
+          header_packages=(/tmp/"linux-headers-${krel}_"*"_${DEB_ARCH}.deb")
 
           if ((${#image_packages[@]} != 1)); then
             echo "::error::Expected exactly one linux-image package, found ${#image_packages[@]}"
@@ -1505,7 +1688,7 @@ jobs:
             architecture="$(dpkg-deb -f "$deb" Architecture)"
             version="$(dpkg-deb -f "$deb" Version)"
             if [[ "$package" != "$expected_package" \
-              || "$architecture" != "amd64" \
+              || "$architecture" != "$DEB_ARCH" \
               || "$version" != "${krel}-1" ]]; then
               echo "::error::Unexpected package metadata: $package $version ($architecture)"
               exit 1
@@ -1577,35 +1760,65 @@ jobs:
 
           verify_feature BBRv1 TCP_CONG_BBR tcp_bbr
           verify_feature BBRv3 TCP_CONG_BBR3 tcp_bbr3
-          verify_feature "VirtIO block" VIRTIO_BLK virtio_blk
-          verify_feature "VirtIO SCSI" SCSI_VIRTIO virtio_scsi
-          verify_feature "VirtIO network" VIRTIO_NET virtio_net
-          verify_feature "Xen block" XEN_BLKDEV_FRONTEND xen-blkfront
-          verify_feature "Xen network" XEN_NETDEV_FRONTEND xen-netfront
-          verify_feature "Hyper-V storage" HYPERV_STORAGE hv_storvsc
-          verify_feature "Hyper-V network" HYPERV_NET hv_netvsc
-          verify_feature "VMware storage" VMWARE_PVSCSI vmw_pvscsi
-          verify_feature "VMware network" VMXNET3 vmxnet3
-          verify_feature "AWS ENA" ENA_ETHERNET ena
-          verify_feature "Google gVNIC" GVE gve
-          verify_feature "Azure MANA" MICROSOFT_MANA mana
-          verify_feature "Intel iAVF" I40EVF iavf
+
+          case "$DEB_ARCH" in
+            amd64)
+              verify_feature "VirtIO block" VIRTIO_BLK virtio_blk
+              verify_feature "VirtIO SCSI" SCSI_VIRTIO virtio_scsi
+              verify_feature "VirtIO network" VIRTIO_NET virtio_net
+              verify_feature "Xen block" XEN_BLKDEV_FRONTEND xen-blkfront
+              verify_feature "Xen network" XEN_NETDEV_FRONTEND xen-netfront
+              verify_feature "Hyper-V storage" HYPERV_STORAGE hv_storvsc
+              verify_feature "Hyper-V network" HYPERV_NET hv_netvsc
+              verify_feature "VMware storage" VMWARE_PVSCSI vmw_pvscsi
+              verify_feature "VMware network" VMXNET3 vmxnet3
+              verify_feature "AWS ENA" ENA_ETHERNET ena
+              verify_feature "Google gVNIC" GVE gve
+              verify_feature "Azure MANA" MICROSOFT_MANA mana
+              verify_feature "Intel iAVF" I40EVF iavf
+              ;;
+            arm64)
+              # U-Boot's booti needs the uncompressed arm64 Image: its
+              # header carries the "ARM\x64" magic at byte 56.
+              image="/tmp/img-check/boot/vmlinuz-$krel"
+              if [[ "$(od -An -tx1 -j56 -N4 "$image" | tr -d ' \n')" != "41524d64" ]]; then
+                echo "::error::$image is not an uncompressed arm64 kernel Image"
+                exit 1
+              fi
+              # The board's device tree ships inside the package, under the
+              # directory U-Boot distro boot and u-boot-menu look in.
+              dtb="/tmp/img-check/usr/lib/linux-image-$krel/allwinner/sun50i-h616-orangepi-zero2.dtb"
+              if [[ ! -s "$dtb" ]] \
+                || [[ "$(od -An -tx1 -N4 "$dtb" | tr -d ' \n')" != "d00dfeed" ]]; then
+                echo "::error::Orange Pi Zero 2 device tree is missing from the image package"
+                exit 1
+              fi
+              verify_feature "SD card host" MMC_SUNXI sunxi-mmc
+              verify_feature "Allwinner Ethernet" DWMAC_SUN8I dwmac-sun8i
+              verify_feature "Motorcomm PHY" MOTORCOMM_PHY motorcomm
+              verify_feature "USB PHY" PHY_SUN4I_USB phy-sun4i-usb
+              verify_feature "USB OTG" USB_MUSB_SUNXI sunxi
+              verify_feature "USB storage" USB_STORAGE usb-storage
+              verify_feature "Watchdog" SUNXI_WATCHDOG sunxi_wdt
+              verify_feature "Audio codec" SND_SUN4I_CODEC sun4i-codec
+              verify_feature "Mali GPU" DRM_PANFROST panfrost
+              verify_feature "SPI" SPI_SUN6I spi-sun6i
+              verify_feature "Crypto engine" CRYPTO_DEV_SUN8I_CE sun8i-ce
+              verify_feature "Infrared receiver" IR_SUNXI sunxi-cir
+              verify_feature "zram" ZRAM zram
+              verify_feature "F2FS" F2FS_FS f2fs
+              ;;
+          esac
 
           grep -q '^CONFIG_DEFAULT_TCP_CONG="bbr"$' "$cfg" || \
             { echo "::error::BBRv1 is not the default"; exit 1; }
           grep -q '^CONFIG_DEFAULT_NET_SCH="fq"$' "$cfg" || \
             { echo "::error::FQ is not the default qdisc"; exit 1; }
 
-      - name: Record build time
-        id: metadata
-        run: |
-          set -euo pipefail
-          echo "build_time=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
-
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: kernel-packages-${{ github.run_id }}
+          name: kernel-packages-${{ github.run_id }}-${{ matrix.arch }}
           path: artifacts/*.deb
           if-no-files-found: error
           compression-level: 0
@@ -1613,84 +1826,136 @@ jobs:
           retention-days: 1
 
   release:
-    name: Release ${{ needs.build.outputs.kernel_release }}
+    name: Release ${{ needs.check.outputs.version }}-shouyu
     needs:
       - check
       - build
-    if: needs.check.outputs.should_build == 'true' && needs.build.result == 'success'
+    # Runs as soon as the build matrix has finished, even when one
+    # architecture failed: whatever was built and verified is published, and
+    # the missing architecture is retried by the next scheduled run.
+    if: >-
+      ${{
+        always() &&
+        needs.check.result == 'success' &&
+        needs.check.outputs.should_build == 'true' &&
+        (needs.build.result == 'success' || needs.build.result == 'failure')
+      }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
+    outputs:
+      build_time: ${{ steps.publish.outputs.build_time }}
+      built_arches: ${{ steps.publish.outputs.built_arches }}
+      failed_arches: ${{ steps.publish.outputs.failed_arches }}
+      kernel_release: ${{ steps.publish.outputs.kernel_release }}
+      published_arches: ${{ steps.publish.outputs.published_arches }}
 
     steps:
       - name: Download verified kernel packages
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: kernel-packages-${{ github.run_id }}
+          pattern: kernel-packages-${{ github.run_id }}-*
+          merge-multiple: true
           path: artifacts
 
       - name: Create or repair Release
+        id: publish
         env:
           GH_TOKEN: ${{ github.token }}
-          BUILD_TIME: ${{ needs.build.outputs.build_time }}
-          KERNEL_RELEASE: ${{ needs.build.outputs.kernel_release }}
+          KERNEL_RELEASE: ${{ needs.check.outputs.version }}-shouyu
           RELEASE_TAG: ${{ needs.check.outputs.release_tag }}
           RELEASE_TARGET: ${{ needs.check.outputs.release_target }}
+          REQUESTED_ARCHES: ${{ needs.check.outputs.build_arches }}
         run: |
           set -euo pipefail
           shopt -s nullglob
 
+          arches=(amd64 arm64)
           if ! [[ "$RELEASE_TAG" == "v${KERNEL_RELEASE}" \
             && "$KERNEL_RELEASE" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?-shouyu$ \
-            && "$RELEASE_TARGET" =~ ^[0-9a-f]{40}$ \
-            && "$BUILD_TIME" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+            && "$RELEASE_TARGET" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::Unsafe Release metadata"
             exit 1
           fi
-
-          packages=(artifacts/*.deb)
-          if ((${#packages[@]} != 2)); then
-            echo "::error::Expected exactly two verified packages"
+          read -r -a requested_arches <<< "$REQUESTED_ARCHES"
+          if ((${#requested_arches[@]} == 0)); then
+            echo "::error::No architecture was requested"
             exit 1
           fi
+          for arch in "${requested_arches[@]}"; do
+            if [[ " ${arches[*]} " != *" $arch "* ]]; then
+              echo "::error::Unknown architecture requested: $arch"
+              exit 1
+            fi
+          done
+          build_time="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
+          # Verified packages from the build matrix, keyed by "<kind>/<arch>".
           declare -A local_path=()
           declare -A local_name=()
           declare -A local_digest=()
           declare -A local_size=()
-          for package_path in "${packages[@]}"; do
+          for package_path in artifacts/*.deb; do
             filename="$(basename "$package_path")"
-            case "$filename" in
-              "linux-image-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb")
-                kind=image
-                ;;
-              "linux-headers-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb")
-                kind=headers
-                ;;
-              *)
-                echo "::error::Unexpected Release package: $filename"
-                exit 1
-                ;;
-            esac
-            if [[ ${local_path["$kind"]+present} ]]; then
-              echo "::error::Duplicate $kind package"
+            key=""
+            for arch in "${arches[@]}"; do
+              case "$filename" in
+                "linux-image-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_${arch}.deb")
+                  key="image/$arch"
+                  ;;
+                "linux-headers-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_${arch}.deb")
+                  key="headers/$arch"
+                  ;;
+              esac
+              [[ -z "$key" ]] || break
+            done
+            if [[ -z "$key" ]]; then
+              echo "::error::Unexpected Release package: $filename"
               exit 1
             fi
-            local_path["$kind"]="$package_path"
-            local_name["$kind"]="$filename"
-            local_digest["$kind"]="sha256:$(sha256sum "$package_path" | awk '{ print $1 }')"
-            local_size["$kind"]="$(stat -c '%s' "$package_path")"
+            if [[ ${local_path["$key"]+present} ]]; then
+              echo "::error::Duplicate $key package"
+              exit 1
+            fi
+            local_path["$key"]="$package_path"
+            local_name["$key"]="$filename"
+            local_digest["$key"]="sha256:$(sha256sum "$package_path" | awk '{ print $1 }')"
+            local_size["$key"]="$(stat -c '%s' "$package_path")"
           done
-          for kind in image headers; do
-            [[ ${local_path["$kind"]+present} ]] \
-              || { echo "::error::Missing $kind package"; exit 1; }
+
+          declare -a built_arches=()
+          declare -a failed_arches=()
+          for arch in "${requested_arches[@]}"; do
+            if [[ ${local_path["image/$arch"]+present} \
+              && ${local_path["headers/$arch"]+present} ]]; then
+              built_arches+=("$arch")
+            elif [[ ${local_path["image/$arch"]+present} \
+              || ${local_path["headers/$arch"]+present} ]]; then
+              echo "::error::The $arch build produced an incomplete package pair"
+              exit 1
+            else
+              failed_arches+=("$arch")
+            fi
           done
+          for key in "${!local_path[@]}"; do
+            arch="${key#*/}"
+            if [[ " ${requested_arches[*]} " != *" $arch "* ]]; then
+              echo "::error::Packages for $arch were built without being requested"
+              exit 1
+            fi
+          done
+          if ((${#built_arches[@]} == 0)); then
+            echo "::error::No architecture produced verified packages"
+            exit 1
+          fi
+          echo "Built architectures: ${built_arches[*]}"
+          echo "Failed architectures: ${failed_arches[*]:-none}"
 
           notes_file="$RUNNER_TEMP/release.md"
           printf 'Version: `%s`\n\nBuild time: `%s`\n' \
             "$KERNEL_RELEASE" \
-            "$BUILD_TIME" \
+            "$build_time" \
             > "$notes_file"
 
           release_json="$RUNNER_TEMP/release-before.json"
@@ -1707,6 +1972,15 @@ jobs:
             echo "::error::Could not determine whether the Release exists"
             exit 1
           fi
+
+          # Everything the Release is expected to hold afterwards: the
+          # package pairs built now, plus complete pairs of other
+          # architectures that were already published.
+          declare -A expected_keys=()
+          for arch in "${built_arches[@]}"; do
+            expected_keys["image/$arch"]=1
+            expected_keys["headers/$arch"]=1
+          done
 
           if [[ "$release_exists" == true ]]; then
             release_id="$(jq -er '.id' "$release_json")"
@@ -1745,46 +2019,86 @@ jobs:
               remote_size["$name"]="$size"
             done < "$remote_assets_file"
 
+            # Architectures that were not rebuilt keep their published pair
+            # untouched. A lone package of such an architecture is useless to
+            # the installer and APT, so it is treated as an obsolete asset.
+            for arch in "${arches[@]}"; do
+              [[ " ${built_arches[*]} " != *" $arch "* ]] || continue
+              image_name="linux-image-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_${arch}.deb"
+              headers_name="linux-headers-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_${arch}.deb"
+              if [[ ${remote_id["$image_name"]+present} \
+                && ${remote_id["$headers_name"]+present} \
+                && "${remote_state[$image_name]}" == "uploaded" \
+                && "${remote_state[$headers_name]}" == "uploaded" ]]; then
+                expected_keys["image/$arch"]=1
+                expected_keys["headers/$arch"]=1
+                local_name["image/$arch"]="$image_name"
+                local_name["headers/$arch"]="$headers_name"
+                local_digest["image/$arch"]="${remote_digest[$image_name]}"
+                local_digest["headers/$arch"]="${remote_digest[$headers_name]}"
+                local_size["image/$arch"]="${remote_size[$image_name]}"
+                local_size["headers/$arch"]="${remote_size[$headers_name]}"
+              fi
+            done
+
             # Fill missing packages first so a repair never starts by emptying
             # an existing public Release.
-            for kind in image headers; do
-              name="${local_name[$kind]}"
-              if [[ ! ${remote_id["$name"]+present} ]]; then
-                gh release upload \
-                  "$RELEASE_TAG" \
-                  "${local_path[$kind]}" \
-                  --repo "$GITHUB_REPOSITORY"
-              fi
+            for arch in "${built_arches[@]}"; do
+              for kind in image headers; do
+                name="${local_name[$kind/$arch]}"
+                if [[ ! ${remote_id["$name"]+present} ]]; then
+                  gh release upload \
+                    "$RELEASE_TAG" \
+                    "${local_path[$kind/$arch]}" \
+                    --repo "$GITHUB_REPOSITORY"
+                fi
+              done
             done
 
             # Replace only conflicting expected packages, one at a time.
-            for kind in image headers; do
-              name="${local_name[$kind]}"
-              [[ ${remote_id["$name"]+present} ]] || continue
-              if [[ "${remote_state[$name]}" != "uploaded" \
-                || "${remote_digest[$name]}" != "${local_digest[$kind]}" \
-                || "${remote_size[$name]}" != "${local_size[$kind]}" ]]; then
-                gh api \
-                  --method DELETE \
-                  "repos/${GITHUB_REPOSITORY}/releases/assets/${remote_id[$name]}"
-                gh release upload \
-                  "$RELEASE_TAG" \
-                  "${local_path[$kind]}" \
-                  --repo "$GITHUB_REPOSITORY"
-              fi
+            for arch in "${built_arches[@]}"; do
+              for kind in image headers; do
+                name="${local_name[$kind/$arch]}"
+                [[ ${remote_id["$name"]+present} ]] || continue
+                if [[ "${remote_state[$name]}" != "uploaded" \
+                  || "${remote_digest[$name]}" != "${local_digest[$kind/$arch]}" \
+                  || "${remote_size[$name]}" != "${local_size[$kind/$arch]}" ]]; then
+                  gh api \
+                    --method DELETE \
+                    "repos/${GITHUB_REPOSITORY}/releases/assets/${remote_id[$name]}"
+                  gh release upload \
+                    "$RELEASE_TAG" \
+                    "${local_path[$kind/$arch]}" \
+                    --repo "$GITHUB_REPOSITORY"
+                fi
+              done
             done
 
-            # Remove obsolete README or old package assets only after both
-            # expected packages have been uploaded or retained.
+            # Remove obsolete README or old package assets only after every
+            # expected package has been uploaded or retained.
+            declare -A expected_names=()
+            for key in "${!expected_keys[@]}"; do
+              expected_names["${local_name[$key]}"]=1
+            done
             for name in "${remote_names[@]}"; do
-              if [[ "$name" != "${local_name[image]}" \
-                && "$name" != "${local_name[headers]}" ]]; then
+              if [[ ! ${expected_names["$name"]+present} ]]; then
                 gh api \
                   --method DELETE \
                   "repos/${GITHUB_REPOSITORY}/releases/assets/${remote_id[$name]}"
               fi
             done
+          fi
 
+          # The amd64 VPS installer reads releases/latest and expects its two
+          # packages there, so a Release is only marked "latest" once the
+          # amd64 pair is in place.
+          latest_flag="--latest=false"
+          if [[ ${expected_keys["image/amd64"]+present} \
+            && ${expected_keys["headers/amd64"]+present} ]]; then
+            latest_flag="--latest"
+          fi
+
+          if [[ "$release_exists" == true ]]; then
             gh release edit \
               "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
@@ -1792,8 +2106,12 @@ jobs:
               --notes-file "$notes_file" \
               --draft=false \
               --prerelease=false \
-              --latest
+              "$latest_flag"
           else
+            packages=()
+            for arch in "${built_arches[@]}"; do
+              packages+=("${local_path[image/$arch]}" "${local_path[headers/$arch]}")
+            done
             gh release create \
               "$RELEASE_TAG" \
               "${packages[@]}" \
@@ -1801,7 +2119,7 @@ jobs:
               --title "$KERNEL_RELEASE" \
               --notes-file "$notes_file" \
               --target "$RELEASE_TARGET" \
-              --latest
+              "$latest_flag"
           fi
 
           expected_body="$(cat "$notes_file")"
@@ -1844,31 +2162,35 @@ jobs:
             fi
             mapfile -t final_assets < "$final_assets_file"
             assets_valid=true
-            declare -A verified_kinds=()
-            if ((${#final_assets[@]} != 2)); then
+            declare -A verified_keys=()
+            if ((${#final_assets[@]} != ${#expected_keys[@]})); then
               assets_valid=false
             else
               for record in "${final_assets[@]}"; do
                 IFS=$'\t' read -r name state digest size <<< "$record"
-                kind=""
-                if [[ "$name" == "${local_name[image]}" ]]; then
-                  kind=image
-                elif [[ "$name" == "${local_name[headers]}" ]]; then
-                  kind=headers
-                else
+                key=""
+                for candidate in "${!expected_keys[@]}"; do
+                  if [[ "$name" == "${local_name[$candidate]}" ]]; then
+                    key="$candidate"
+                    break
+                  fi
+                done
+                if [[ -z "$key" ]]; then
                   assets_valid=false
                   continue
                 fi
-                verified_kinds["$kind"]=1
+                verified_keys["$key"]=1
+                # A pair kept from an earlier upload may predate GitHub's
+                # server-side digests; the normalize job refreshes those.
                 if [[ "$state" != "uploaded" \
-                  || "$digest" != "${local_digest[$kind]}" \
-                  || "$size" != "${local_size[$kind]}" ]]; then
+                  || ( -n "${local_digest[$key]}" && "$digest" != "${local_digest[$key]}" ) \
+                  || "$size" != "${local_size[$key]}" ]]; then
                   assets_valid=false
                 fi
               done
-              [[ ${verified_kinds["image"]+present} \
-                && ${verified_kinds["headers"]+present} ]] \
-                || assets_valid=false
+              for key in "${!expected_keys[@]}"; do
+                [[ ${verified_keys["$key"]+present} ]] || assets_valid=false
+              done
             fi
 
             if [[ "$actual_name" == "$KERNEL_RELEASE" \
@@ -1882,6 +2204,31 @@ jobs:
           done
           [[ "$verified" == true ]] \
             || { echo "::error::Release verification failed"; exit 1; }
+
+          published_arches=()
+          for arch in "${arches[@]}"; do
+            if [[ ${expected_keys["image/$arch"]+present} ]]; then
+              published_arches+=("$arch")
+            fi
+          done
+          {
+            echo "build_time=$build_time"
+            echo "built_arches=${built_arches[*]}"
+            echo "failed_arches=${failed_arches[*]:-}"
+            echo "kernel_release=$KERNEL_RELEASE"
+            echo "published_arches=${published_arches[*]}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release"
+            echo
+            echo "- Tag: \`$RELEASE_TAG\`"
+            echo "- Built now: \`${built_arches[*]}\`"
+            echo "- Failed: \`${failed_arches[*]:-none}\`"
+            echo "- Published architectures: \`${published_arches[*]}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if ((${#failed_arches[@]} > 0)); then
+            echo "::warning::No packages were published for: ${failed_arches[*]}"
+          fi
 
   apt-repository:
     name: Publish signed APT repository
@@ -1904,11 +2251,10 @@ jobs:
     env:
       APT_PUBLIC_KEY: apt/shouyu-kernel-archive-keyring.asc
       REPOSITORY: ${{ github.repository }}
-      FROM_BUILD: ${{ needs.release.result == 'success' }}
       KERNEL_RELEASE: >-
         ${{
           needs.release.result == 'success'
-          && needs.build.outputs.kernel_release
+          && needs.release.outputs.kernel_release
           || needs.check.outputs.existing_kernel_release
         }}
       RELEASE_TAG: >-
@@ -1966,23 +2312,42 @@ jobs:
               | if length == 1 then (.[0].digest // "") else "" end
             ' "$release_json"
           }
-          image_name="linux-image-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb"
-          headers_name="linux-headers-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_amd64.deb"
-          image_digest="$(asset_digest "$image_name")"
-          headers_digest="$(asset_digest "$headers_name")"
-          if ! [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ \
-            && "$headers_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::$RELEASE_TAG lacks uniquely named packages with SHA-256 digests"
-            exit 1
+          # The index describes every architecture whose package pair is in
+          # the Release. amd64 is mandatory: the VPS installer and every
+          # existing client depend on it, so a Release that only carries
+          # arm64 (because the amd64 build failed) leaves the published
+          # index untouched until amd64 catches up.
+          present_arches=()
+          for arch in amd64 arm64; do
+            image_name="linux-image-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_${arch}.deb"
+            headers_name="linux-headers-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_${arch}.deb"
+            image_digest="$(asset_digest "$image_name")"
+            headers_digest="$(asset_digest "$headers_name")"
+            if [[ -z "$image_digest" && -z "$headers_digest" ]]; then
+              echo "$RELEASE_TAG has no $arch packages"
+              continue
+            fi
+            if ! [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ \
+              && "$headers_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::$RELEASE_TAG lacks uniquely named $arch packages with SHA-256 digests"
+              exit 1
+            fi
+            present_arches+=("$arch")
+            arch_upper="${arch^^}"
+            export "EXPECTED_IMAGE_SHA256_${arch_upper}=${image_digest#sha256:}"
+            export "EXPECTED_HEADERS_SHA256_${arch_upper}=${headers_digest#sha256:}"
+            {
+              echo "EXPECTED_IMAGE_SHA256_${arch_upper}=${image_digest#sha256:}"
+              echo "EXPECTED_HEADERS_SHA256_${arch_upper}=${headers_digest#sha256:}"
+            } >> "$GITHUB_ENV"
+          done
+          if [[ " ${present_arches[*]} " != *" amd64 "* ]]; then
+            echo "::warning::$RELEASE_TAG has no amd64 packages yet; the APT index is left unchanged."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          export EXPECTED_IMAGE_SHA256="${image_digest#sha256:}"
-          export EXPECTED_HEADERS_SHA256="${headers_digest#sha256:}"
-          {
-            echo "EXPECTED_IMAGE_SHA256=$EXPECTED_IMAGE_SHA256"
-            echo "EXPECTED_HEADERS_SHA256=$EXPECTED_HEADERS_SHA256"
-            echo "IMAGE_NAME=$image_name"
-            echo "HEADERS_NAME=$headers_name"
-          } >> "$GITHUB_ENV"
+          export ARCHES="${present_arches[*]}"
+          echo "ARCHES=$ARCHES" >> "$GITHUB_ENV"
 
           inspect_status=0
           bash .github/scripts/apt-repo.sh inspect || inspect_status=$?
@@ -1996,30 +2361,27 @@ jobs:
             echo "current=$current"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Download the verified build packages
-        if: >-
-          steps.inspect.outputs.enabled == 'true' &&
-          steps.inspect.outputs.current != 'true' &&
-          env.FROM_BUILD == 'true'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: kernel-packages-${{ github.run_id }}
-          path: ${{ runner.temp }}/apt-packages
-
       - name: Download the published packages
         if: >-
           steps.inspect.outputs.enabled == 'true' &&
-          steps.inspect.outputs.current != 'true' &&
-          env.FROM_BUILD != 'true'
+          steps.inspect.outputs.current != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Always the bytes GitHub serves to users; the build script checks
+          # them against the Release digests recorded above.
+          patterns=()
+          for arch in $ARCHES; do
+            patterns+=(
+              --pattern "linux-image-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_${arch}.deb"
+              --pattern "linux-headers-${KERNEL_RELEASE}_${KERNEL_RELEASE}-1_${arch}.deb"
+            )
+          done
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --dir "$RUNNER_TEMP/apt-packages" \
-            --pattern "$IMAGE_NAME" \
-            --pattern "$HEADERS_NAME"
+            "${patterns[@]}"
 
       - name: Build and sign the APT index
         if: >-
@@ -2100,6 +2462,7 @@ jobs:
               echo
               echo '```'
               echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/shouyu-kernel.asc] https://github.com/${GITHUB_REPOSITORY}/releases/download/ ${APT_SUITE}/"
+              echo "deb [arch=arm64 signed-by=/etc/apt/keyrings/shouyu-kernel.asc] https://github.com/${GITHUB_REPOSITORY}/releases/download/ ${APT_SUITE}/"
               echo '```'
             } > "$notes_file"
             gh release create "$APT_SUITE" \
@@ -2133,7 +2496,7 @@ jobs:
           # Meta-packages are built byte-identically, so an unchanged one
           # keeps its existing asset instead of a delete-and-reupload gap.
           uploads=()
-          for deb in "$out"/linux-image-shouyu_*_amd64.deb "$out"/linux-headers-shouyu_*_amd64.deb; do
+          for deb in "$out"/linux-image-shouyu_*.deb "$out"/linux-headers-shouyu_*.deb; do
             digest="sha256:$(sha256sum "$deb" | awk '{ print $1 }')"
             if [[ "${published_digest["$(basename "$deb")"]:-}" != "$digest" ]]; then
               uploads+=("$deb")
@@ -2158,10 +2521,10 @@ jobs:
           # longer part of the index is removed right away.
           retention_seconds=$((30 * 24 * 60 * 60))
           now="$(date -u +%s)"
-          current_meta=("$out"/linux-image-shouyu_*_amd64.deb)
+          current_meta=("$out"/linux-image-shouyu_*.deb)
           current_version="$(basename "${current_meta[0]}")"
           current_version="${current_version#linux-image-shouyu_}"
-          current_version="${current_version%_amd64.deb}"
+          current_version="${current_version%_*.deb}"
           declare -A keep=()
           for file in "$out"/*; do
             keep["$(basename "$file")"]=1
@@ -2170,7 +2533,9 @@ jobs:
           declare -A meta_asset_ids=()
           list_assets
           while IFS=$'\t' read -r asset_id asset_name created_at digest; do
-            if [[ "$asset_name" =~ ^linux-(image|headers)-shouyu_([0-9][0-9A-Za-z.+~-]*)_amd64\.deb$ ]]; then
+            # Meta-packages of every architecture share one version, so the
+            # retention below keeps or removes a version's pairs together.
+            if [[ "$asset_name" =~ ^linux-(image|headers)-shouyu_([0-9][0-9A-Za-z.+~-]*)_(amd64|arm64)\.deb$ ]]; then
               version="${BASH_REMATCH[2]}"
               published_at="$(date -u -d "$created_at" +%s)"
               if [[ -z "${meta_published_at[$version]:-}" ]] \
@@ -2224,6 +2589,7 @@ jobs:
             echo "### APT repository"
             echo
             echo "- Kernel: \`$KERNEL_RELEASE\` from \`$RELEASE_TAG\`"
+            echo "- Architectures: \`$ARCHES\`"
             echo "- Source: \`deb https://github.com/${GITHUB_REPOSITORY}/releases/download/ ${APT_SUITE}/\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -2253,8 +2619,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
-          KERNEL_RELEASE: ${{ needs.build.outputs.kernel_release }}
-          BUILD_TIME: ${{ needs.build.outputs.build_time }}
+          KERNEL_RELEASE: ${{ needs.release.outputs.kernel_release }}
+          BUILD_TIME: ${{ needs.release.outputs.build_time }}
+          PUBLISHED_ARCHES: ${{ needs.release.outputs.published_arches }}
           RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.check.outputs.release_tag }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -2284,8 +2651,8 @@ jobs:
           fi
 
           message="$(printf \
-            '内核编译并发布成功\n版本：%s\n构建时间：%s\nRelease：%s\n运行记录：%s' \
-            "$KERNEL_RELEASE" "$BUILD_TIME" "$RELEASE_URL" "$RUN_URL")"
+            '内核编译并发布成功\n版本：%s\n架构：%s\n构建时间：%s\nRelease：%s\n运行记录：%s' \
+            "$KERNEL_RELEASE" "$PUBLISHED_ARCHES" "$BUILD_TIME" "$RELEASE_URL" "$RUN_URL")"
           request+=(--data-urlencode "text=$message")
           send_request=("${request[@]}")
           if [[ -n "${TELEGRAM_MESSAGE_THREAD_ID:-}" ]]; then
@@ -2326,6 +2693,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
           TARGET_VERSION: ${{ needs.check.outputs.version }}-shouyu
+          REQUESTED_ARCHES: ${{ needs.check.outputs.build_arches }}
+          BUILT_ARCHES: ${{ needs.release.outputs.built_arches }}
+          FAILED_ARCHES: ${{ needs.release.outputs.failed_arches }}
           CHECK_RESULT: ${{ needs.check.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           RELEASE_RESULT: ${{ needs.release.result }}
@@ -2358,8 +2728,9 @@ jobs:
           fi
 
           message="$(printf \
-            '内核编译或发布失败\n目标版本：%s\n检查：%s\n编译：%s\n发布：%s\nAPT 仓库：%s\n运行记录：%s' \
-            "$TARGET_VERSION" "$CHECK_RESULT" "$BUILD_RESULT" \
+            '内核编译或发布失败\n目标版本：%s\n计划架构：%s\n检查：%s\n编译：%s（成功：%s；失败：%s）\n发布：%s\nAPT 仓库：%s\n运行记录：%s' \
+            "$TARGET_VERSION" "${REQUESTED_ARCHES:-?}" "$CHECK_RESULT" "$BUILD_RESULT" \
+            "${BUILT_ARCHES:-无}" "${FAILED_ARCHES:-无}" \
             "$RELEASE_RESULT" "$APT_RESULT" "$RUN_URL")"
           request+=(--data-urlencode "text=$message")
           send_request=("${request[@]}")

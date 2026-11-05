@@ -10,9 +10,12 @@
 # Filename in Packages is relative to the archive root releases/download/.
 # The kernel packages therefore stay in their versioned Release
 # (v7.2.11-shouyu/linux-image-...deb) and are never copied; only the signed
-# index and two tiny meta-packages live in the "apt" Release. The meta-packages
-# (linux-image-shouyu, linux-headers-shouyu) always depend on the newest
-# kernel, so "apt upgrade" moves machines to new releases.
+# index and the tiny meta-packages live in the "apt" Release. The meta-packages
+# (linux-image-shouyu, linux-headers-shouyu, one pair per architecture) always
+# depend on the newest kernel, so "apt upgrade" moves machines to new releases.
+# One index serves every architecture: APT filters the Packages file by the
+# Architecture field, so amd64 VPS and arm64 boards share the same source line
+# apart from the [arch=...] option.
 #
 # Usage:
 #   apt-repo.sh inspect [--download-all]
@@ -28,11 +31,14 @@
 #   APT_PUBLIC_KEY           committed ASCII-armored public key (.asc)
 #   RELEASE_TAG              versioned Release that holds the kernel packages
 #   KERNEL_RELEASE           kernel release, e.g. 7.2.11-shouyu
-#   EXPECTED_IMAGE_SHA256    SHA-256 of the published image package
-#   EXPECTED_HEADERS_SHA256  SHA-256 of the published headers package
+#   ARCHES                   space-separated Debian architectures published in
+#                            that Release (default: amd64)
+#   EXPECTED_IMAGE_SHA256_<ARCH>    SHA-256 of the published image package,
+#                            one per architecture, e.g. ..._AMD64, ..._ARM64
+#   EXPECTED_HEADERS_SHA256_<ARCH>  SHA-256 of the published headers package
 #   WORK_DIR                 scratch directory
 #   build only:
-#   PACKAGE_DIR              directory holding the two kernel packages
+#   PACKAGE_DIR              directory holding every kernel package
 #   OUT_DIR                  output directory for the APT Release assets
 #   APT_SIGNING_FPR          fingerprint of the signing key in $GNUPGHOME
 #   APT_SIGNING_PASSPHRASE_FILE  optional passphrase file for that key
@@ -58,9 +64,9 @@ require_env() {
     done
 }
 
-require_env REPOSITORY APT_PUBLIC_KEY RELEASE_TAG KERNEL_RELEASE \
-    EXPECTED_IMAGE_SHA256 EXPECTED_HEADERS_SHA256 WORK_DIR
+require_env REPOSITORY APT_PUBLIC_KEY RELEASE_TAG KERNEL_RELEASE WORK_DIR
 APT_SUITE="${APT_SUITE:-apt}"
+ARCHES="${ARCHES:-amd64}"
 APT_REPO_URL="${APT_REPO_URL:-https://github.com/${REPOSITORY}/releases/download/}"
 
 [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
@@ -73,8 +79,22 @@ APT_REPO_URL="${APT_REPO_URL:-https://github.com/${REPOSITORY}/releases/download
     || die "Unexpected kernel release: $KERNEL_RELEASE"
 [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?(-(shouyu|cloud))?(-[0-9]+)?$ ]] \
     || die "Unexpected Release tag: $RELEASE_TAG"
-for digest in "$EXPECTED_IMAGE_SHA256" "$EXPECTED_HEADERS_SHA256"; do
-    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "Invalid expected SHA-256: $digest"
+read -r -a arches <<< "$ARCHES"
+((${#arches[@]} > 0)) || die "ARCHES must name at least one architecture"
+declare -A expected_image_sha=()
+declare -A expected_headers_sha=()
+for arch in "${arches[@]}"; do
+    [[ "$arch" =~ ^(amd64|arm64)$ ]] || die "Unsupported architecture: $arch"
+    [[ ! ${expected_image_sha["$arch"]+present} ]] \
+        || die "Architecture listed twice: $arch"
+    image_var="EXPECTED_IMAGE_SHA256_${arch^^}"
+    headers_var="EXPECTED_HEADERS_SHA256_${arch^^}"
+    require_env "$image_var" "$headers_var"
+    for digest in "${!image_var}" "${!headers_var}"; do
+        [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "Invalid expected SHA-256: $digest"
+    done
+    expected_image_sha["$arch"]="${!image_var}"
+    expected_headers_sha["$arch"]="${!headers_var}"
 done
 [[ "$APT_PUBLIC_KEY" == *.asc && -s "$APT_PUBLIC_KEY" ]] \
     || die "APT public key must be a non-empty .asc file: $APT_PUBLIC_KEY"
@@ -85,25 +105,27 @@ readonly package_version="${KERNEL_RELEASE}-1"
 readonly meta_version="${KERNEL_RELEASE%%-*}-1"
 readonly image_package="linux-image-${KERNEL_RELEASE}"
 readonly headers_package="linux-headers-${KERNEL_RELEASE}"
-readonly image_deb="${image_package}_${package_version}_amd64.deb"
-readonly headers_deb="${headers_package}_${package_version}_amd64.deb"
-readonly image_meta_deb="linux-image-shouyu_${meta_version}_amd64.deb"
-readonly headers_meta_deb="linux-headers-shouyu_${meta_version}_amd64.deb"
+
+image_deb() { printf '%s_%s_%s.deb' "$image_package" "$package_version" "$1"; }
+headers_deb() { printf '%s_%s_%s.deb' "$headers_package" "$package_version" "$1"; }
+image_meta_deb() { printf 'linux-image-shouyu_%s_%s.deb' "$meta_version" "$1"; }
+headers_meta_deb() { printf 'linux-headers-shouyu_%s_%s.deb' "$meta_version" "$1"; }
 
 mkdir -p "$WORK_DIR"
 
 # Print one tab-separated record per stanza of a Packages file:
-# Package, Version, Filename, SHA256, Depends.
+# Package, Architecture, Version, Filename, SHA256, Depends.
 packages_records() {
     awk '
         function flush() {
             if (pkg != "") {
-                print pkg "\t" ver "\t" file "\t" sha "\t" dep
+                print pkg "\t" arch "\t" ver "\t" file "\t" sha "\t" dep
             }
-            pkg = ver = file = sha = dep = ""
+            pkg = arch = ver = file = sha = dep = ""
         }
         /^$/ { flush(); next }
         /^Package: / { pkg = substr($0, 10) }
+        /^Architecture: / { arch = substr($0, 15) }
         /^Version: / { ver = substr($0, 10) }
         /^Filename: / { file = substr($0, 11) }
         /^SHA256: / { sha = substr($0, 9) }
@@ -112,24 +134,33 @@ packages_records() {
     ' "$1" | LC_ALL=C sort
 }
 
+# The meta-package digests are passed through the sha_image_meta and
+# sha_headers_meta associative arrays (keyed by architecture).
+declare -A sha_image_meta=()
+declare -A sha_headers_meta=()
 expected_records() {
-    local sha_image_meta=$1
-    local sha_headers_meta=$2
+    local arch
     {
-        printf '%s\t%s\t%s\t%s\t%s\n' \
-            "$headers_package" "$package_version" \
-            "${RELEASE_TAG}/${headers_deb}" "$EXPECTED_HEADERS_SHA256" ""
-        printf '%s\t%s\t%s\t%s\t%s\n' \
-            "$image_package" "$package_version" \
-            "${RELEASE_TAG}/${image_deb}" "$EXPECTED_IMAGE_SHA256" ""
-        printf '%s\t%s\t%s\t%s\t%s\n' \
-            linux-headers-shouyu "$meta_version" \
-            "${APT_SUITE}/${headers_meta_deb}" "$sha_headers_meta" \
-            "$headers_package (= $package_version)"
-        printf '%s\t%s\t%s\t%s\t%s\n' \
-            linux-image-shouyu "$meta_version" \
-            "${APT_SUITE}/${image_meta_deb}" "$sha_image_meta" \
-            "$image_package (= $package_version)"
+        for arch in "${arches[@]}"; do
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$headers_package" "$arch" "$package_version" \
+                "${RELEASE_TAG}/$(headers_deb "$arch")" \
+                "${expected_headers_sha[$arch]}" ""
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$image_package" "$arch" "$package_version" \
+                "${RELEASE_TAG}/$(image_deb "$arch")" \
+                "${expected_image_sha[$arch]}" ""
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                linux-headers-shouyu "$arch" "$meta_version" \
+                "${APT_SUITE}/$(headers_meta_deb "$arch")" \
+                "${sha_headers_meta[$arch]}" \
+                "$headers_package (= $package_version)"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                linux-image-shouyu "$arch" "$meta_version" \
+                "${APT_SUITE}/$(image_meta_deb "$arch")" \
+                "${sha_image_meta[$arch]}" \
+                "$image_package (= $package_version)"
+        done
     } | LC_ALL=C sort
 }
 
@@ -140,8 +171,10 @@ write_apt_config() {
     rm -rf "$root"
     mkdir -p "$root/lists/partial" "$root/archives/partial" "$root/log"
     : > "$root/status"
-    printf 'deb [arch=amd64 signed-by=%s] %s %s/\n' \
-        "$(realpath "$APT_PUBLIC_KEY")" "$APT_REPO_URL" "$APT_SUITE" \
+    local arch_list
+    arch_list="$(IFS=,; printf '%s' "${arches[*]}")"
+    printf 'deb [arch=%s signed-by=%s] %s %s/\n' \
+        "$arch_list" "$(realpath "$APT_PUBLIC_KEY")" "$APT_REPO_URL" "$APT_SUITE" \
         > "$root/sources.list"
     cat > "$root/apt.conf" <<EOF
 Dir::Etc::main "/dev/null";
@@ -158,8 +191,8 @@ Dir::State::status "$root/status";
 Dir::Cache "$root/";
 Dir::Cache::archives "$root/archives/";
 Dir::Log "$root/log/";
-APT::Architecture "amd64";
-APT::Architectures { "amd64"; };
+APT::Architecture "${arches[0]}";
+APT::Architectures { $(printf '"%s"; ' "${arches[@]}")};
 Acquire::Languages "none";
 APT::Update::Error-Mode "any";
 Acquire::Retries "3";
@@ -192,50 +225,56 @@ inspect() {
     apt-cache dumpavail > "$available"
 
     mkdir -p "$download_dir"
-    if ! (cd "$download_dir" \
-        && apt-get -q download linux-image-shouyu linux-headers-shouyu); then
+    local arch
+    local -a meta_downloads=()
+    local -a kernel_downloads=()
+    for arch in "${arches[@]}"; do
+        meta_downloads+=("linux-image-shouyu:$arch" "linux-headers-shouyu:$arch")
+        kernel_downloads+=("$image_package:$arch" "$headers_package:$arch")
+    done
+    if ! (cd "$download_dir" && apt-get -q download "${meta_downloads[@]}"); then
         stale "the published meta-packages are missing or do not match the index"
     fi
-    local sha_image_meta
-    local sha_headers_meta
-    sha_image_meta="$(sha256sum "$download_dir/$image_meta_deb" 2>/dev/null \
-        | awk '{ print $1 }')" \
-        || stale "unexpected linux-image-shouyu version"
-    sha_headers_meta="$(sha256sum "$download_dir/$headers_meta_deb" 2>/dev/null \
-        | awk '{ print $1 }')" \
-        || stale "unexpected linux-headers-shouyu version"
-    [[ -n "$sha_image_meta" && -n "$sha_headers_meta" ]] \
-        || stale "the meta-packages do not point at ${KERNEL_RELEASE}"
+    for arch in "${arches[@]}"; do
+        sha_image_meta["$arch"]="$(
+            sha256sum "$download_dir/$(image_meta_deb "$arch")" 2>/dev/null \
+                | awk '{ print $1 }'
+        )" || stale "unexpected linux-image-shouyu version for $arch"
+        sha_headers_meta["$arch"]="$(
+            sha256sum "$download_dir/$(headers_meta_deb "$arch")" 2>/dev/null \
+                | awk '{ print $1 }'
+        )" || stale "unexpected linux-headers-shouyu version for $arch"
+        [[ -n "${sha_image_meta[$arch]}" && -n "${sha_headers_meta[$arch]}" ]] \
+            || stale "the $arch meta-packages do not point at ${KERNEL_RELEASE}"
+    done
 
-    if ! diff -u \
-        <(expected_records "$sha_image_meta" "$sha_headers_meta") \
-        <(packages_records "$available") >&2; then
+    if ! diff -u <(expected_records) <(packages_records "$available") >&2; then
         stale "the published index does not describe ${RELEASE_TAG} exactly"
     fi
 
     if [[ "$download_all" == true ]]; then
         # End-to-end check through GitHub's redirects; apt verifies every
         # byte against the signed index.
-        (cd "$download_dir" \
-            && apt-get -q download "$image_package" "$headers_package") \
+        (cd "$download_dir" && apt-get -q download "${kernel_downloads[@]}") \
             || stale "a kernel package cannot be downloaded through APT"
     fi
-    echo "APT repository serves ${KERNEL_RELEASE} with a valid signature."
+    echo "APT repository serves ${KERNEL_RELEASE} (${arches[*]}) with a valid signature."
 }
 
 build_meta_package() {
     local name=$1
-    local dependency=$2
-    local summary=$3
-    local output=$4
-    local tree="$WORK_DIR/meta/$name"
+    local arch=$2
+    local dependency=$3
+    local summary=$4
+    local output=$5
+    local tree="$WORK_DIR/meta/$name-$arch"
 
     rm -rf "$tree"
     install -d -m 0755 "$tree/DEBIAN"
     cat > "$tree/DEBIAN/control" <<EOF
 Package: $name
 Version: $meta_version
-Architecture: amd64
+Architecture: $arch
 Maintainer: $MAINTAINER
 Depends: $dependency (= $package_version)
 Section: kernel
@@ -266,35 +305,42 @@ build() {
     rm -rf "$stage" "$OUT_DIR"
     mkdir -p "$stage/$RELEASE_TAG" "$stage/$APT_SUITE" "$OUT_DIR"
 
-    local kind file expected package version architecture
-    for kind in image headers; do
-        if [[ "$kind" == image ]]; then
-            file="$image_deb"
-            expected="$EXPECTED_IMAGE_SHA256"
-            package="$image_package"
-        else
-            file="$headers_deb"
-            expected="$EXPECTED_HEADERS_SHA256"
-            package="$headers_package"
-        fi
-        [[ -f "$PACKAGE_DIR/$file" ]] || die "Missing package: $file"
-        [[ "$(sha256sum "$PACKAGE_DIR/$file" | awk '{ print $1 }')" == "$expected" ]] \
-            || die "$file does not match the published Release asset"
-        version="$(dpkg-deb -f "$PACKAGE_DIR/$file" Version)"
-        architecture="$(dpkg-deb -f "$PACKAGE_DIR/$file" Architecture)"
-        [[ "$(dpkg-deb -f "$PACKAGE_DIR/$file" Package)" == "$package" \
-            && "$version" == "$package_version" \
-            && "$architecture" == amd64 ]] \
-            || die "Unexpected control data in $file"
-        cp -- "$PACKAGE_DIR/$file" "$stage/$RELEASE_TAG/"
-    done
+    local arch kind file expected package version architecture
+    local -a meta_debs=()
+    for arch in "${arches[@]}"; do
+        for kind in image headers; do
+            if [[ "$kind" == image ]]; then
+                file="$(image_deb "$arch")"
+                expected="${expected_image_sha[$arch]}"
+                package="$image_package"
+            else
+                file="$(headers_deb "$arch")"
+                expected="${expected_headers_sha[$arch]}"
+                package="$headers_package"
+            fi
+            [[ -f "$PACKAGE_DIR/$file" ]] || die "Missing package: $file"
+            [[ "$(sha256sum "$PACKAGE_DIR/$file" | awk '{ print $1 }')" == "$expected" ]] \
+                || die "$file does not match the published Release asset"
+            version="$(dpkg-deb -f "$PACKAGE_DIR/$file" Version)"
+            architecture="$(dpkg-deb -f "$PACKAGE_DIR/$file" Architecture)"
+            [[ "$(dpkg-deb -f "$PACKAGE_DIR/$file" Package)" == "$package" \
+                && "$version" == "$package_version" \
+                && "$architecture" == "$arch" ]] \
+                || die "Unexpected control data in $file"
+            cp -- "$PACKAGE_DIR/$file" "$stage/$RELEASE_TAG/"
+        done
 
-    build_meta_package linux-image-shouyu "$image_package" \
-        "Latest Linux stable kernel image for VPS (meta-package)" \
-        "$stage/$APT_SUITE/$image_meta_deb"
-    build_meta_package linux-headers-shouyu "$headers_package" \
-        "Latest Linux stable kernel headers for VPS (meta-package)" \
-        "$stage/$APT_SUITE/$headers_meta_deb"
+        build_meta_package linux-image-shouyu "$arch" "$image_package" \
+            "Latest Linux stable kernel image (meta-package)" \
+            "$stage/$APT_SUITE/$(image_meta_deb "$arch")"
+        build_meta_package linux-headers-shouyu "$arch" "$headers_package" \
+            "Latest Linux stable kernel headers (meta-package)" \
+            "$stage/$APT_SUITE/$(headers_meta_deb "$arch")"
+        meta_debs+=(
+            "$stage/$APT_SUITE/$(image_meta_deb "$arch")"
+            "$stage/$APT_SUITE/$(headers_meta_deb "$arch")"
+        )
+    done
 
     # dpkg-scanpackages writes Filename relative to the current directory,
     # which is exactly the archive-root-relative path APT needs.
@@ -304,14 +350,17 @@ build() {
         dpkg-scanpackages --multiversion "$APT_SUITE" /dev/null 2>/dev/null
     ) > "$OUT_DIR/Packages"
     gzip -9 --no-name --stdout "$OUT_DIR/Packages" > "$OUT_DIR/Packages.gz"
-    cp -- "$stage/$APT_SUITE/$image_meta_deb" "$stage/$APT_SUITE/$headers_meta_deb" \
-        "$OUT_DIR/"
+    cp -- "${meta_debs[@]}" "$OUT_DIR/"
 
-    if ! diff -u \
-        <(expected_records \
-            "$(sha256sum "$OUT_DIR/$image_meta_deb" | awk '{ print $1 }')" \
-            "$(sha256sum "$OUT_DIR/$headers_meta_deb" | awk '{ print $1 }')") \
-        <(packages_records "$OUT_DIR/Packages") >&2; then
+    for arch in "${arches[@]}"; do
+        sha_image_meta["$arch"]="$(
+            sha256sum "$OUT_DIR/$(image_meta_deb "$arch")" | awk '{ print $1 }'
+        )"
+        sha_headers_meta["$arch"]="$(
+            sha256sum "$OUT_DIR/$(headers_meta_deb "$arch")" | awk '{ print $1 }'
+        )"
+    done
+    if ! diff -u <(expected_records) <(packages_records "$OUT_DIR/Packages") >&2; then
         die "Generated Packages index has unexpected content"
     fi
 
@@ -321,8 +370,8 @@ build() {
         printf 'Suite: stable\n'
         printf 'Codename: %s\n' "$APT_SUITE"
         printf 'Date: %s\n' "$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S UTC')"
-        printf 'Architectures: amd64\n'
-        printf 'Description: Latest Linux stable kernels for Debian/Ubuntu VPS\n'
+        printf 'Architectures: %s\n' "${arches[*]}"
+        printf 'Description: Latest Linux stable kernels for Debian/Ubuntu\n'
         printf 'SHA256:\n'
         for file in Packages Packages.gz; do
             printf ' %s %16s %s\n' \

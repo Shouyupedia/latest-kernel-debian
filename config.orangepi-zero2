@@ -1,0 +1,229 @@
+#
+# Project overlay for the Orange Pi Zero 2 (Allwinner H616, arm64).
+# Debian's base config, its arm64 config and config.common are merged before
+# this file. Debian enables every arm64 platform; this overlay keeps only the
+# Allwinner platform so the kernel stays small and builds quickly, and makes
+# the devices needed to reach the SD card root filesystem built-in.
+#
+# Not covered by mainline Linux as of this writing and therefore not provided:
+# the on-board AW859A Wi-Fi/Bluetooth module (uwe5622, out-of-tree only) and
+# HDMI output (the H616 display engine has no mainline device tree yet).
+#
+
+# CPU and platform. Only the Allwinner platform is enabled; the workflow
+# fails the build if any other platform from arch/arm64/Kconfig.platforms
+# is turned on.
+CONFIG_ARM64=y
+CONFIG_ARCH_SUNXI=y
+# CONFIG_ARCH_ACTIONS is not set
+# CONFIG_ARCH_AIROHA is not set
+# CONFIG_ARCH_ALPINE is not set
+# CONFIG_ARCH_APPLE is not set
+# CONFIG_ARCH_ARTPEC is not set
+# CONFIG_ARCH_ASPEED is not set
+# CONFIG_ARCH_AXIADO is not set
+# CONFIG_ARCH_BCM is not set
+# CONFIG_ARCH_BCM2835 is not set
+# CONFIG_ARCH_BCMBCA is not set
+# CONFIG_ARCH_BCM_IPROC is not set
+# CONFIG_ARCH_BERLIN is not set
+# CONFIG_ARCH_BITMAIN is not set
+# CONFIG_ARCH_BLAIZE is not set
+# CONFIG_ARCH_BRCMSTB is not set
+# CONFIG_ARCH_BST is not set
+# CONFIG_ARCH_CIX is not set
+# CONFIG_ARCH_EXYNOS is not set
+# CONFIG_ARCH_HISI is not set
+# CONFIG_ARCH_INTEL_SOCFPGA is not set
+# CONFIG_ARCH_K3 is not set
+# CONFIG_ARCH_KEEMBAY is not set
+# CONFIG_ARCH_LAN969X is not set
+# CONFIG_ARCH_LAYERSCAPE is not set
+# CONFIG_ARCH_LG1K is not set
+# CONFIG_ARCH_MA35 is not set
+# CONFIG_ARCH_MEDIATEK is not set
+# CONFIG_ARCH_MESON is not set
+# CONFIG_ARCH_MICROCHIP is not set
+# CONFIG_ARCH_MMP is not set
+# CONFIG_ARCH_MVEBU is not set
+# CONFIG_ARCH_MXC is not set
+# CONFIG_ARCH_NPCM is not set
+# CONFIG_ARCH_NXP is not set
+# CONFIG_ARCH_PENSANDO is not set
+# CONFIG_ARCH_QCOM is not set
+# CONFIG_ARCH_REALTEK is not set
+# CONFIG_ARCH_RENESAS is not set
+# CONFIG_ARCH_ROCKCHIP is not set
+# CONFIG_ARCH_S32 is not set
+# CONFIG_ARCH_SEATTLE is not set
+# CONFIG_ARCH_SOPHGO is not set
+# CONFIG_ARCH_SPARX5 is not set
+# CONFIG_ARCH_SPRD is not set
+# CONFIG_ARCH_STM32 is not set
+# CONFIG_ARCH_SYNQUACER is not set
+# CONFIG_ARCH_TEGRA is not set
+# CONFIG_ARCH_TESLA_FSD is not set
+# CONFIG_ARCH_THUNDER is not set
+# CONFIG_ARCH_THUNDER2 is not set
+# CONFIG_ARCH_UNIPHIER is not set
+# CONFIG_ARCH_VEXPRESS is not set
+# CONFIG_ARCH_VISCONTI is not set
+# CONFIG_ARCH_XGENE is not set
+# CONFIG_ARCH_ZYNQMP is not set
+CONFIG_NR_CPUS=8
+# CONFIG_PCI is not set
+# CONFIG_ACPI is not set
+# CONFIG_ARM_SMMU is not set
+# CONFIG_ARM_SMMU_V3 is not set
+CONFIG_CMA=y
+CONFIG_DMA_CMA=y
+
+# U-Boot's booti loads /boot/vmlinuz as an uncompressed arm64 Image.
+# CONFIG_COMPRESSED_INSTALL is not set
+# CONFIG_EFI_ZBOOT is not set
+
+# Allwinner H616 SoC core: clocks, pins, SRAM, interrupts, DMA, IOMMU and
+# power domains are built in so the root filesystem never depends on the
+# initramfs carrying the right modules.
+CONFIG_SUNXI_CCU=y
+CONFIG_SUN50I_H616_CCU=y
+CONFIG_SUN50I_H6_R_CCU=y
+CONFIG_SUN6I_RTC_CCU=y
+CONFIG_SUN8I_DE2_CCU=y
+CONFIG_PINCTRL_SUN50I_H616=y
+CONFIG_PINCTRL_SUN50I_H616_R=y
+CONFIG_SUNXI_SRAM=y
+CONFIG_RESET_SUNXI=y
+CONFIG_SUN6I_R_INTC=y
+CONFIG_SUNXI_NMI_INTC=y
+CONFIG_DMA_SUN6I=y
+CONFIG_IOMMU_SUPPORT=y
+CONFIG_SUN50I_IOMMU=y
+CONFIG_SUN50I_H6_PRCM_PPU=y
+CONFIG_RTC_DRV_SUN6I=y
+CONFIG_NVMEM_SUNXI_SID=y
+CONFIG_SUNXI_WATCHDOG=m
+
+# Serial console (the SoC has six UARTs), SD card and the AXP305 PMIC that
+# powers the SD card slot.
+CONFIG_SERIAL_8250_DW=y
+CONFIG_SERIAL_8250_NR_UARTS=8
+CONFIG_SERIAL_8250_RUNTIME_UARTS=8
+CONFIG_MMC=y
+CONFIG_MMC_BLOCK=y
+CONFIG_MMC_SUNXI=y
+CONFIG_SUNXI_RSB=y
+CONFIG_I2C=y
+CONFIG_I2C_MV64XXX=y
+CONFIG_MFD_AXP20X_RSB=y
+CONFIG_MFD_AXP20X_I2C=y
+CONFIG_REGULATOR=y
+CONFIG_REGULATOR_FIXED_VOLTAGE=y
+CONFIG_REGULATOR_AXP20X=y
+CONFIG_INPUT_AXP20X_PEK=m
+
+# CPU frequency scaling and thermal throttling (the board has no fan).
+CONFIG_CPU_FREQ=y
+CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL=y
+CONFIG_CPU_FREQ_GOV_SCHEDUTIL=y
+CONFIG_CPUFREQ_DT=y
+CONFIG_CPUFREQ_DT_PLATDEV=y
+CONFIG_ARM_ALLWINNER_SUN50I_CPUFREQ_NVMEM=y
+CONFIG_THERMAL=y
+CONFIG_CPU_THERMAL=y
+CONFIG_SUN8I_THERMAL=y
+
+# Gigabit Ethernet: DesignWare MAC with the board's Motorcomm YT8531 PHY.
+CONFIG_STMMAC_ETH=m
+CONFIG_STMMAC_PLATFORM=m
+CONFIG_DWMAC_SUN8I=m
+CONFIG_MOTORCOMM_PHY=m
+CONFIG_REALTEK_PHY=m
+
+# USB 2.0 host ports and the OTG port.
+CONFIG_USB=y
+CONFIG_PHY_SUN4I_USB=m
+CONFIG_USB_EHCI_HCD=y
+CONFIG_USB_EHCI_HCD_PLATFORM=m
+CONFIG_USB_OHCI_HCD=y
+CONFIG_USB_OHCI_HCD_PLATFORM=m
+CONFIG_USB_MUSB_HDRC=m
+CONFIG_USB_MUSB_SUNXI=m
+CONFIG_USB_STORAGE=m
+CONFIG_USB_HID=m
+CONFIG_HID_GENERIC=m
+CONFIG_INPUT_EVDEV=y
+
+# Audio (analog codec on the header, I2S, S/PDIF, digital microphone).
+CONFIG_SOUND=m
+CONFIG_SND=m
+CONFIG_SND_SOC=m
+CONFIG_SND_SUN4I_CODEC=m
+CONFIG_SND_SUN4I_I2S=m
+CONFIG_SND_SUN4I_SPDIF=m
+CONFIG_SND_SUN50I_DMIC=m
+CONFIG_SND_SIMPLE_CARD=m
+
+# Mali-G31 GPU through panfrost; the Allwinner display driver is kept so HDMI
+# starts working once its H616 device tree support reaches a stable release.
+CONFIG_DRM=m
+CONFIG_DRM_PANFROST=m
+CONFIG_DRM_SUN4I=m
+CONFIG_DRM_SUN8I_MIXER=m
+CONFIG_DRM_SUN8I_DW_HDMI=m
+
+# Peripherals on the headers and the on-board SPI flash that holds U-Boot.
+CONFIG_SPI=y
+CONFIG_SPI_SUN6I=m
+CONFIG_SPI_SPIDEV=m
+CONFIG_I2C_CHARDEV=m
+CONFIG_PWM=y
+CONFIG_PWM_SUN4I=m
+CONFIG_GPIO_CDEV=y
+CONFIG_GPIO_SYSFS=y
+CONFIG_LEDS_CLASS=y
+CONFIG_LEDS_GPIO=m
+CONFIG_MTD=m
+CONFIG_MTD_BLOCK=m
+CONFIG_MTD_SPI_NOR=m
+CONFIG_IIO=m
+CONFIG_SUN20I_GPADC=m
+CONFIG_KEYBOARD_SUN4I_LRADC=m
+CONFIG_CRYPTO_DEV_ALLWINNER=y
+CONFIG_CRYPTO_DEV_SUN8I_CE=m
+CONFIG_CRYPTO_DEV_SUN8I_CE_HASH=y
+CONFIG_CRYPTO_DEV_SUN8I_CE_TRNG=y
+
+# Infrared receiver; the SoC driver is built even though the mainline board
+# device tree does not enable the receiver yet.
+CONFIG_MEDIA_SUPPORT=m
+CONFIG_MEDIA_SUPPORT_FILTER=y
+CONFIG_MEDIA_CAMERA_SUPPORT=y
+CONFIG_MEDIA_USB_SUPPORT=y
+# CONFIG_MEDIA_ANALOG_TV_SUPPORT is not set
+# CONFIG_MEDIA_DIGITAL_TV_SUPPORT is not set
+# CONFIG_MEDIA_RADIO_SUPPORT is not set
+# CONFIG_MEDIA_SDR_SUPPORT is not set
+# CONFIG_MEDIA_PLATFORM_SUPPORT is not set
+CONFIG_RC_CORE=m
+CONFIG_IR_SUNXI=m
+
+# Memory: a 512 MiB/1 GiB board benefits from compressed swap.
+CONFIG_SWAP=y
+CONFIG_ZSWAP=y
+CONFIG_ZRAM=m
+CONFIG_ZSMALLOC=y
+
+# Filesystems for SD cards and FAT boot partitions, built in where U-Boot
+# distro boot or the root filesystem may need them before any initramfs.
+CONFIG_VFAT_FS=y
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ISO8859_1=y
+CONFIG_NLS_UTF8=y
+CONFIG_F2FS_FS=m
+
+# No hypervisor guest or host support on a single-board computer.
+# CONFIG_VIRTUALIZATION is not set
+# CONFIG_XEN is not set
+# CONFIG_HYPERV is not set
+# CONFIG_VIRTIO_MENU is not set

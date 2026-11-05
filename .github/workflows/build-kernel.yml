@@ -1616,10 +1616,19 @@ jobs:
             exit 1
           fi
           ccache --zero-stats
+          build_args=()
+          if [[ "$DEB_ARCH" == arm64 ]]; then
+            # builddeb packages KBUILD_IMAGE, which on arm64 defaults to the
+            # gzip-compressed Image.gz. U-Boot's booti and the boot scripts of
+            # Armbian and Orange Pi images load the plain Image, so that is
+            # what /boot/vmlinuz must be.
+            build_args+=(KBUILD_IMAGE=arch/arm64/boot/Image)
+          fi
           # bindeb-pkg is rootless (Rules-Requires-Root: no; dpkg-deb
           # --root-owner-group), so the compile does not run under fakeroot's
           # LD_PRELOAD, which serializes every stat() through faked.
           make -j"$(nproc)" bindeb-pkg \
+            "${build_args[@]}" \
             KBUILD_DEBARCH="$DEB_ARCH" \
             KDEB_PKGVERSION="${KREL}-1"
           {

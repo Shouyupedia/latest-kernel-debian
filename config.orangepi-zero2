@@ -78,7 +78,8 @@ CONFIG_NR_CPUS=8
 CONFIG_CMA=y
 CONFIG_DMA_CMA=y
 
-# U-Boot's booti loads /boot/vmlinuz as an uncompressed arm64 Image.
+# /boot/vmlinuz must be the plain arm64 Image that U-Boot's booti loads: no
+# EFI zboot wrapper, and the workflow packages Image rather than Image.gz.
 # CONFIG_COMPRESSED_INSTALL is not set
 # CONFIG_EFI_ZBOOT is not set
 

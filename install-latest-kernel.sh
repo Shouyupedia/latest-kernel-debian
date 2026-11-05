@@ -129,9 +129,9 @@ fi
 
 architecture="$(dpkg --print-architecture)"
 [[ "$architecture" == "$SUPPORTED_ARCH" ]] \
-    || die "当前仅提供 amd64 内核，检测到的架构为 $architecture。"
+    || die "本安装器仅支持 amd64 VPS，检测到的架构为 $architecture。Orange Pi Zero 2（arm64）请按 README 手动配置 APT 源安装。"
 [[ "$(uname -m)" == "x86_64" ]] \
-    || die "当前仅支持 x86_64 内核。"
+    || die "本安装器仅支持 x86_64 VPS。"
 
 declare -a as_root=()
 if ((EUID != 0)); then
